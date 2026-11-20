@@ -102,6 +102,14 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    # Model prose reaches stdout too, and it carries glyphs a cp1252 console cannot
+    # encode ("->" arrows, middle dots, dashes). Without this the summary print
+    # raises mid-run and the run looks like a failure after it actually finished.
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(errors="replace")
+        except (AttributeError, ValueError):
+            pass
     args = build_parser().parse_args(argv)
     handlers = {
         "init": cmd_init, "demo": cmd_demo, "run": cmd_run, "serve": cmd_serve,

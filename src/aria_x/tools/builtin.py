@@ -12,7 +12,7 @@ registry itself always exposes the full catalog.
 
 from __future__ import annotations
 
-from . import knowledge, net, session, terminal
+from . import auth, knowledge, net, session, terminal
 from .base import ToolContext, ToolRegistry
 
 #: Exact tool names promised by the contracts document (§4).
@@ -20,6 +20,9 @@ TOOL_NAMES: tuple[str, ...] = (
     "terminal_exec", "session_open", "session_send", "session_read", "session_close",
     "session_list", "file_read", "file_write", "file_list",
     "http_request", "dns_lookup", "port_scan", "tls_probe", "web_probe", "web_search",
+    # auth neighbourhood: session continuity, differentials, JWTs, mining, recovery
+    "http_session", "http_matrix", "jwt_inspect", "route_mine", "artifact_probe",
+    "code_probe", "id_walk", "vault",
     "add_fact", "add_finding", "add_asset", "anchor_node", "graph_query", "search_traces",
     "memory_store", "memory_search", "todo_update", "prove_goal",
     "delegate_specialist", "scope_check",
@@ -30,6 +33,8 @@ READ_ONLY_TOOLS: tuple[str, ...] = (
     "file_read", "file_list", "dns_lookup", "tls_probe", "web_search", "graph_query",
     "session_read", "session_list",
     "search_traces", "memory_search", "scope_check",
+    # read-only: these only observe or decode, never mutate the target
+    "jwt_inspect", "route_mine", "vault",
 )
 
 
@@ -43,6 +48,7 @@ def build_registry(ctx: ToolContext | None = None) -> ToolRegistry:
     terminal.register(registry)
     session.register(registry)
     net.register(registry)
+    auth.register(registry)
     knowledge.register(registry)
     return registry
 

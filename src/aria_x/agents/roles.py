@@ -47,6 +47,16 @@ RECON_TOOLS: tuple[str, ...] = (
     "tls_probe",
     "web_probe",
     "web_search",
+    # auth neighbourhood: without these a worker cannot hold a session, cannot see
+    # a differential and cannot keep a captured token past evidence redaction.
+    "http_session",
+    "http_matrix",
+    "jwt_inspect",
+    "route_mine",
+    "artifact_probe",
+    "code_probe",
+    "id_walk",
+    "vault",
 )
 
 #: Tools that mutate the blackboard / asset graph. Workers own these.
@@ -90,7 +100,13 @@ PLANNER_TOOLS: tuple[str, ...] = (
 #: Specialist → tools. Deliberately minimal; missing expertise is delegated TO
 #: a specialist, so a specialist must not delegate further.
 SPECIALIST_TOOLS: dict[str, tuple[str, ...]] = {
-    "researcher": ("http_request", "web_search", "web_probe", "file_read"),
+    "researcher": ("http_request", "web_search", "web_probe", "file_read",
+                   "route_mine", "jwt_inspect"),
+    #: auth work is its own specialism: the toolset is a probing harness, not a scanner.
+    "authenticator": ("http_request", "http_matrix", "http_session", "jwt_inspect",
+                      "code_probe", "id_walk", "vault", "file_read"),
+    "harvester": ("artifact_probe", "route_mine", "file_read", "file_write",
+                  "http_request"),
     "coder": ("terminal_exec", "session_open", "session_send", "session_read",
               "session_close", "session_list", "file_read", "file_write", "file_list"),
     "adviser": ("graph_query", "search_traces", "memory_search"),

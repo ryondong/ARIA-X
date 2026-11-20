@@ -1,0 +1,75 @@
+# ARIA-X engagement config — SuperCam Plus (com.tvt.supercamplus) endpoint surface.
+# Envelope: passive/read-only probes only (DNS, TLS handshake, HEAD/GET, bounded TCP).
+# No auth attempts, no fuzzing, no payloads. One request per endpoint, stop on non-200.
+# Targets are the hostnames discovered statically in the APK (2026-11-20).
+
+name = "SuperCam Plus endpoint surface"
+data_dir = "data"
+runs_dir = "runs"
+log_level = "INFO"
+
+[scope]
+authorized = true
+targets = [
+  "starvisioncloud.com",
+  "m.autonat.com",
+  "c2.autonat.com",
+  "eu.autonat.com",
+  "app-log.autonat.com",
+  "app-log20-cn-ipv6.starvisioncloud.com",
+  "partner-gz-app-log20.starvisioncloud.com",
+  "en.tvt.net.cn",
+]
+# Nothing outside the discovered endpoint set. Deny other TVT/cloud infrastructure.
+deny = []
+# allow_private is on ONLY so a DNS answer naming a private address can be *observed*
+# and recorded as a finding. The goal text forbids connecting to it.
+allow_private = true
+allow_loopback = true
+max_rps = 2.0
+ports = [80, 443, 8130, 40002]
+
+[llm]
+provider = "openai"
+base_url = "https://api.deepseek.com/v1"
+model = "deepseek-chat"
+api_key = ""
+temperature = 0.2
+max_tokens = 4096
+max_retries = 2
+tool_mode = "auto"
+json_mode = false
+
+[budget]
+max_seconds = 420
+max_llm_calls = 14
+max_tokens = 220000
+max_tool_calls = 20
+max_steps_per_task = 10
+max_intents_per_reason = 1
+max_concurrency = 1
+max_total_intents = 5
+
+[sandbox]
+backend = "local"
+image = "kalilinux/kali-rolling"
+network = "none"
+timeout = 45
+max_output = 8000
+
+[safety]
+approval = "auto"
+block_destructive = true
+redact_secrets = true
+allow_public_targets = true
+max_command_seconds = 30
+
+[server]
+host = "127.0.0.1"
+port = 8788
+
+[engine]
+language = "en"
+bootstrap = true
+max_idle_rounds = 2
+require_finding_for_completion = true

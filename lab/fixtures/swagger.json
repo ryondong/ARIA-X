@@ -1,0 +1,17 @@
+{
+  "openapi": "3.0.0",
+  "paths": {
+    "/login": {
+      "post": {}
+    },
+    "/account/{id}": {
+      "get": {}
+    },
+    "/export": {
+      "get": {}
+    },
+    "/api/admin/users": {
+      "get": {}
+    }
+  }
+}

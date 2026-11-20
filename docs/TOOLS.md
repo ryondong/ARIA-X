@@ -35,6 +35,14 @@
 | `tls_probe` | medium | 是 | `host` | TLS 握手与证书信息 |
 | `web_probe` | medium | 是 | `base_url` | 小字典路径探测 |
 | `web_search` | low | — | `query` | 外部研究搜索（非目标流量） |
+| `http_session` | medium | 是 | `action` | 命名 Cookie 罐会话，可捕获 token 为请求头 |
+| `http_matrix` | medium | 是 | `url` | 差分探测：基线 + 变体，逐行判定差异信号 |
+| `jwt_inspect` | low | — | `token` | 解码/标记/破解 HMAC/重签 JWT |
+| `route_mine` | low | 是 | `url` | 从文档与同源脚本/源码映射挖掘端点与密钥 |
+| `artifact_probe` | medium | 是 | `base_url` | 探测不应暴露的路径，命中即哈希存证 |
+| `code_probe` | medium | 是 | `url` | 有界验证码/令牌枚举，报告覆盖率与速率 |
+| `id_walk` | medium | 是 | `url` | 对象引用遍历，按偏离中位数排序 |
+| `vault` | low | — | `action` | 运行级密文存储（防证据脱敏丢失） |
 | `add_fact` | low | — | `title`, `body` | 黑板写入 fact |
 | `add_finding` | medium | — | `title`, `severity`, `body` | 黑板写入 finding + 证据 |
 | `add_asset` | low | — | `kind`, `value` | 资产图 upsert |

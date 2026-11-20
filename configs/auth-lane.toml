@@ -1,0 +1,71 @@
+# Auth lane — loopback lab, credential and authorization work.
+#
+#   ./run-auth.sh goal auth-presence          # one bounded auth run against the lab
+#
+# Differences from configs/laptop.toml, and why:
+#   * more intents and tokens — auth work legitimately needs several probes to
+#     separate a bypass from a coincidental 200, so the fan-out cap is raised a
+#     little (2), not opened up;
+#   * lower max_rps — the login endpoint is the loudest thing on any target;
+#   * approval stays "auto" for loopback; switch to "ask" before a real host.
+# Everything else is identical, including require_finding_for_completion: a run
+# that ends with no finding is not a result, it is a hunch.
+
+name = "Auth lane (loopback)"
+data_dir = "data"
+runs_dir = "runs"
+log_level = "INFO"
+
+[scope]
+authorized = true
+targets = ["127.0.0.1", "localhost"]
+deny = []
+allow_private = true
+allow_loopback = true
+max_rps = 2.5                    # deliberate: the login and OTP endpoints are rate-limited
+ports = [80, 443, 8000, 8080, 8443, 8888, 8899, 8787]
+
+[llm]
+provider = "openai"
+base_url = "https://api.deepseek.com/v1"
+model = "deepseek-chat"
+api_key = ""                     # ARIA_X_API_KEY from the environment (run-auth.sh bridges it)
+temperature = 0.2
+max_tokens = 4096
+max_retries = 2
+tool_mode = "auto"
+json_mode = false                # DeepSeek: on corrupts the report's Markdown
+
+[budget]
+max_seconds = 900
+max_llm_calls = 120
+max_tokens = 1_200_000
+max_tool_calls = 160
+max_steps_per_task = 16
+max_intents_per_reason = 2
+max_concurrency = 1              # 1 keeps a differential run readable and gentle
+max_total_intents = 8
+
+[sandbox]
+backend = "local"
+image = "kalilinux/kali-rolling"
+network = "none"
+timeout = 60
+max_output = 20000
+
+[safety]
+approval = "auto"
+block_destructive = true
+redact_secrets = true
+allow_public_targets = true
+max_command_seconds = 60
+
+[server]
+host = "127.0.0.1"
+port = 8787
+
+[engine]
+language = "en"
+bootstrap = true
+max_idle_rounds = 2
+require_finding_for_completion = true

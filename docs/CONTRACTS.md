@@ -154,6 +154,23 @@ Register exactly these names via `build_registry(ctx)` in `tools/builtin.py`:
 - `tls_probe(host, port?)` — scope-guarded TLS handshake, cert subject/issuer/SAN/expiry/self-signed.
 - `web_probe(base_url, paths?)` — scope-guarded GET of a small wordlist, returns status/length/content-type.
 - `web_search(query)` — DuckDuckGo HTML endpoint; returns title/url/snippet; graceful failure; this is external research, not target traffic.
+- **Auth neighbourhood (`tools/auth.py`, added locally).** Same scope/rate-limit/evidence pipeline as
+  `http_request`; every one of them calls `scope.require_url` before I/O.
+  - `http_session(action, name?, url?, method?, headers?, body?, capture?, follow?)` — named persistent
+    cookie jar; `capture=[{from:'json'|'header'|'body', as_header, path|regex|name, prefix}]` lifts a
+    token into a header for later calls. Redirects off unless `follow`.
+  - `http_matrix(url, family?|variants?, method?, headers?, body?, session?, token?)` — differential: one
+    baseline plus controlled variants; returns per-row verdict (`same`/`DIFF`) and the changed signal.
+    Families: `auth_presence`, `host_header`, `method_override`, `path_tricks`, `header_trust`.
+  - `jwt_inspect(token, secret?, crack?, wordlist?, forge?)` — decode, flag, verify/crack HMAC, re-forge.
+  - `route_mine(url, max_scripts?)` — mine endpoints, secrets, GraphQL ops and source maps from a document
+    and its same-origin scripts/maps.
+  - `artifact_probe(base_url, tier?, paths?, soft_404?)` — probe should-not-be-served paths (tiers s/m/l),
+    soft-404 aware, HIT saves a hashed evidence artifact and sniffs the type.
+  - `code_probe(url, charset?, length?, start?, max_attempts?, match?, xff_rotate?)` — bounded code-space
+    enumeration with baseline differential, rate/coverage/ETA reporting.
+  - `id_walk(url, start/count|ids, marker?)` — object-reference walk ranked by deviation from the median.
+  - `vault(action, name?, value?, reveal?)` — run-scoped secret store under `workdir/state/vault.json`.
 - `add_fact(title, body, confidence?, intent_id?, asset_values?)` — writes node + edges from intent.
 - `add_finding(title, severity, body, asset_values?, intent_id?, cvss?, evidence?)` — writes finding + evidence.
 - `add_asset(kind, value, parent_value?)` — upsert asset under project.
@@ -167,7 +184,8 @@ Register exactly these names via `build_registry(ctx)` in `tools/builtin.py`:
 - `scope_check(target)` — returns scope decision (diagnostic).
 
 All state-changing tools emit `Events` and audit. `http_request`/`port_scan`/`dns_lookup`/`tls_probe`/
-`web_probe` MUST call scope before network I/O. Never log secrets unredacted (use `util.redact`).
+`web_probe`/`http_session`/`http_matrix`/`route_mine`/`artifact_probe`/`code_probe`/`id_walk`
+MUST call scope before network I/O. Never log secrets unredacted (use `util.redact`).
 
 ## 5. HTTP API (server-dev)
 

@@ -1,0 +1,1 @@
+{"version": 3, "file": "app.js", "sources": ["src/api.ts", "src/config.ts", "src/auth/guard.ts"], "sourcesContent": ["export const API = '/api/v1/';\nexport const ADMIN = '/api/admin/users';\n", "// hardcoded for staging, honest\nexport const DB_PASSWORD='lab-db-pass-77';\n", "export const ADMIN_ROLES = ['admin','superuser'];\n"]}

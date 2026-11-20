@@ -236,7 +236,12 @@ class RoleCompositionTests(unittest.TestCase):
 
     def test_specialist_toolsets(self) -> None:
         expected = {
-            "researcher": {"http_request", "web_search", "web_probe", "file_read"},
+            "researcher": {"http_request", "web_search", "web_probe", "file_read",
+                           "route_mine", "jwt_inspect"},
+            "authenticator": {"http_request", "http_matrix", "http_session", "jwt_inspect",
+                              "code_probe", "id_walk", "vault", "file_read"},
+            "harvester": {"artifact_probe", "route_mine", "file_read", "file_write",
+                          "http_request"},
             "coder": {"terminal_exec", "session_open", "session_send", "session_read",
                       "session_close", "session_list", "file_read", "file_write", "file_list"},
             "adviser": {"graph_query", "search_traces", "memory_search"},
