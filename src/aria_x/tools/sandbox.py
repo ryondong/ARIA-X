@@ -268,12 +268,30 @@ def _base_env() -> dict[str, str]:
 
 
 def _kill_group(proc: subprocess.Popen[str]) -> None:
-    try:
-        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-    except (ProcessLookupError, PermissionError):
+    """Kill the whole process group; Windows has no ``os.killpg``.
+
+    Windows patch kept local to this file: ``start_new_session=True`` is a no-op
+    there, so the tree is killed with ``taskkill /T /F`` and the child alone
+    otherwise. Without this, every timeout in ``LocalSandbox.run`` raised
+    ``AttributeError`` on Windows and left the shell running.
+    """
+    if os.name == "nt":
+        try:
+            subprocess.run(["taskkill", "/T", "/F", "/PID", str(proc.pid)],
+                           capture_output=True, timeout=10)
+        except (OSError, subprocess.SubprocessError):
+            pass
         try:
             proc.kill()
-        except ProcessLookupError:
+        except OSError:
+            pass
+        return
+    try:
+        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+    except (ProcessLookupError, PermissionError, AttributeError):
+        try:
+            proc.kill()
+        except OSError:
             pass
 
 

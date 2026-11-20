@@ -271,6 +271,10 @@ Work only this intent. Use tools to obtain real evidence. Then return the worker
 - assets: only assets you actually observed.
 - goal_proven: true only if the engagement goal is directly demonstrated.
 
+EVIDENCE RULE: network and file tools return an `evidence_path`. Pass that exact
+path in the finding's `evidence` field (paths, not URLs) so the stored evidence
+is hash-addressed; a bare URL produces an evidence row with no sha256.
+
 Write the fact/finding narrative in {('Simplified Chinese' if (language or '').lower().startswith('zh') else 'English')}.
 """
 
@@ -285,6 +289,10 @@ def bootstrap_task(goal: str, context: str, language: str) -> str:
 # YOUR JOB
 Make one direct attempt at the goal, then report what you learned using the worker JSON contract.
 Do not enumerate the whole target surface; pick the highest-value first move.
+
+EVIDENCE RULE: tools return an `evidence_path` for every request they save. Pass that
+exact path (not the URL) in the finding's `evidence` field so stored evidence is
+hash-addressed.
 """
 
 

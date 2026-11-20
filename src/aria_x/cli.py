@@ -153,7 +153,7 @@ def open_bus(config: AriaXConfig) -> EventBus:
 
 
 def print_banner(config: AriaXConfig | None = None) -> None:
-    print(f"ARIA-X {__version__} — {TAGLINE}")
+    print(_safe(f"ARIA-X {__version__} — {TAGLINE}"))
     if config is not None:
         print(f"  data: {config.data_dir}")
         print(f"  provider: {config.llm.provider} / {config.llm.model}")
@@ -210,7 +210,7 @@ class EventPrinter:
         icon = self.ICONS.get(event.type, "·")
         line = self._describe(event.type, data)
         if line:
-            print(f"  {icon} {line}")
+            print(f"  {_safe(icon)} {_safe(line)}")
 
     def _describe(self, type_: str, data: dict[str, Any]) -> str:
         if type_ == "run.started":
@@ -482,6 +482,40 @@ def cmd_serve(args: argparse.Namespace) -> int:
     return 0
 
 
+_ASCII_FALLBACK = {
+    "▶": ">", "■": "#", "✖": "x", "Ⅱ": "||", "→": ">", "✓": "+", "✗": "x",
+    "★": "*", "◇": "o", "·": ".", "☑": "[x]", "⤓": "v", "…": "...", "✎": "~",
+}
+
+
+def _safe(text: str) -> str:
+    """Degrade any character the console encoding cannot encode.
+
+    The event printer thread died on cp1252 the first time it met the ▶ icon,
+    which silently killed live progress output for the rest of the run.
+    """
+    encoding = sys.stdout.encoding or "ascii"
+    try:
+        text.encode(encoding, errors="strict")
+        return text
+    except (UnicodeEncodeError, LookupError):
+        out = "".join(_ASCII_FALLBACK.get(ch, ch) for ch in text)
+        return out.encode(encoding, errors="replace").decode(encoding, errors="replace")
+
+
+def _utf8_console(preferred: str, fallback: str) -> str:
+    """Return a glyph only when the console encoding can render it.
+
+    cp1252 consoles raised ``UnicodeEncodeError`` on the ✓/✗ marks and killed
+    ``doctor`` before it printed a single line.
+    """
+    try:
+        preferred.encode((sys.stdout.encoding or "ascii"), errors="strict")
+        return preferred
+    except (UnicodeEncodeError, LookupError):
+        return fallback
+
+
 def cmd_doctor(args: argparse.Namespace) -> int:
     checks: list[dict[str, Any]] = []
     ok_all = True
@@ -549,10 +583,11 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         print(json_dumps(checks, indent=2, ensure_ascii=False))
     else:
         print(f"ARIA-X {__version__} doctor")
+        good, bad = _utf8_console("✓", "OK"), _utf8_console("✗", "FAIL")
         for item in checks:
-            mark = "✓" if item["ok"] else "✗"
+            mark = good if item["ok"] else bad
             print(f"  {mark} {item['check']:<14} {item['detail']}")
-        print("\nAll core checks passed." if ok_all else "\nSome checks failed; fix the ✗ items above.")
+        print("\nAll core checks passed." if ok_all else f"\nSome checks failed; fix the {bad} items above.")
     return 0 if ok_all else 1
 
 

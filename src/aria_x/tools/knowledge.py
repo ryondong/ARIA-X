@@ -19,6 +19,7 @@ from __future__ import annotations
 import ipaddress
 import math
 import re
+from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
 from ..errors import ToolError
@@ -258,6 +259,38 @@ def add_finding(ctx: ToolContext, kwargs: dict[str, Any]) -> ToolResult:
     return ToolResult.success(data, text=json_dumps(data))
 
 
+def _newest_artifact_for_url(ctx: ToolContext, url: str) -> Path | None:
+    """Find the youngest saved evidence artifact that cites *url*.
+
+    Bounded: only the 40 newest files in ``<workdir>/evidence`` are read, so a
+    long engagement cannot turn this into a filesystem scan.
+    """
+    try:
+        directory = Path(ctx.workdir) / "evidence"
+        if not directory.is_dir():
+            return None
+        files = sorted((p for p in directory.iterdir() if p.is_file()),
+                       key=lambda p: p.stat().st_mtime, reverse=True)[:40]
+    except OSError:
+        return None
+    # Exact-URL match first, then a prefix match (artifacts quote the full URL).
+    for candidate in files:
+        try:
+            text = candidate.read_text("utf-8", "replace")
+        except OSError:
+            continue
+        if f'"{url}"' in text:
+            return candidate
+    for candidate in files:
+        try:
+            text = candidate.read_text("utf-8", "replace")
+        except OSError:
+            continue
+        if url in text:
+            return candidate
+    return None
+
+
 def _store_evidence(ctx: ToolContext, finding_id: str, raw_evidence: Any) -> list[str]:
     """Persist evidence rows from structured dicts or plain path/URL strings."""
     items = raw_evidence if isinstance(raw_evidence, (list, tuple)) else ([raw_evidence] if raw_evidence else [])
@@ -275,13 +308,22 @@ def _store_evidence(ctx: ToolContext, finding_id: str, raw_evidence: Any) -> lis
                 continue
             kind = "url" if text.startswith(("http://", "https://")) else "path"
             path, excerpt, digest, meta = text, "", "", {}
+            if kind == "url":
+                # Models routinely cite the URL and forget the artifact the tool
+                # saved for it. Recover it so the evidence stays hash-addressed.
+                recovered = _newest_artifact_for_url(ctx, text)
+                if recovered is not None:
+                    meta = {"artifact": recovered.name, "cited_url": text}
+                    path = recovered
+                    kind = "observation"
         else:
             continue
         if path and not digest:
             candidate = None
             try:
                 from .terminal import resolve_in_workdir
-                candidate = resolve_in_workdir(ctx, path, must_exist=True)
+                candidate = (path if isinstance(path, Path)
+                             else resolve_in_workdir(ctx, path, must_exist=True))
             except (ToolError, OSError):
                 candidate = None
             if candidate is not None and candidate.is_file():
@@ -290,10 +332,14 @@ def _store_evidence(ctx: ToolContext, finding_id: str, raw_evidence: Any) -> lis
                     digest = sha256_bytes(candidate.read_bytes())
                     if not excerpt:
                         excerpt = truncate(redact(candidate.read_text("utf-8", "replace")), 2000)
+                    try:
+                        path = str(candidate.relative_to(Path(ctx.workdir).resolve()))
+                    except ValueError:
+                        path = str(candidate)
                 except OSError:
                     pass
         evidence = Evidence(id=new_id("ev"), project_id=ctx.project.id, finding_id=finding_id,
-                            kind=kind, path=path, sha256=digest, excerpt=excerpt,
+                            kind=kind, path=str(path), sha256=digest, excerpt=excerpt,
                             meta=meta, created_at=now_iso())
         ctx.store.add_evidence(evidence)
         ids.append(evidence.id)

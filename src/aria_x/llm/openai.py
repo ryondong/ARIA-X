@@ -57,6 +57,13 @@ class OpenAIProvider:
             payload["tools"] = [{"type": "function", "function": _clean_tool(t)} for t in tools]
             payload["tool_choice"] = kwargs.get("tool_choice", "auto")
         if json_mode:
+            # DeepSeek (and some vLLM builds) reject response_format=json_object
+            # unless the word "json" appears somewhere in the prompt. Guarantee
+            # it here so plain-prose prompts (doctor probe, specialist tasks)
+            # do not 400 while json_mode stays on for every role.
+            if not any("json" in str(m.get("content") or "").lower() for m in payload["messages"]):
+                payload["messages"] = list(payload["messages"]) + [
+                    {"role": "system", "content": "Return exactly one JSON object, no prose."}]
             payload["response_format"] = {"type": "json_object"}
         payload.update(self.extra_body)
 

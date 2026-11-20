@@ -1,0 +1,69 @@
+# ARIA-X local config — laptop, loopback-only, authorized testing only.
+# Secrets come from the environment: ARIA_X_API_KEY (never written here).
+# 01NGVI-QINGYI/ARIA-X v0.1.1, AGPL-3.0-or-later. Local Windows patches are noted in SKILL usage.
+
+name = "Laptop loopback"
+data_dir = "data"
+runs_dir = "runs"
+log_level = "INFO"
+
+[scope]
+# The authorization gate: an engagement refuses to start unless both are set.
+authorized = true
+targets = ["127.0.0.1", "localhost"]
+# Deny wins over allow. Keep SSH off the scan surface of the host itself.
+deny = []
+allow_private = true
+allow_loopback = true
+max_rps = 3.0
+ports = [80, 443, 8000, 8080, 8443, 8888]
+
+[llm]
+provider = "openai"
+base_url = "https://api.deepseek.com/v1"
+model = "deepseek-chat"
+api_key = ""                   # prefer ARIA_X_API_KEY in the environment
+temperature = 0.2
+max_tokens = 4096
+max_retries = 2
+tool_mode = "auto"
+# DeepSeek: on forces response_format=json_object for EVERY role, which corrupts the
+# reporter's Markdown. Contracts still work prompt-side, so keep it off here.
+json_mode = false
+
+[budget]
+# Cheap on purpose: a loopback experiment should settle in minutes, not burn tokens.
+max_seconds = 600
+max_llm_calls = 90
+max_tokens = 900000
+max_tool_calls = 120
+max_steps_per_task = 14
+max_intents_per_reason = 1
+max_concurrency = 1            # 1 keeps runs deterministic and readable
+max_total_intents = 6
+
+[sandbox]
+backend = "local"              # local | docker | mock — Docker is the real isolation boundary
+image = "kalilinux/kali-rolling"
+network = "none"
+timeout = 60
+max_output = 20000
+
+[safety]
+approval = "auto"              # auto | ask | deny — set "ask" before touching anything real
+block_destructive = true
+redact_secrets = true
+allow_public_targets = true
+max_command_seconds = 60
+
+[server]
+host = "127.0.0.1"
+port = 8787
+
+[engine]
+language = "en"                # zh | en — report narrative language
+bootstrap = true                # one direct first attempt before the search loop
+max_idle_rounds = 2
+# A planner "complete" without a recorded finding is the main way this engine
+# inflates confidence: the prose claims proof, the report body stays empty.
+require_finding_for_completion = true

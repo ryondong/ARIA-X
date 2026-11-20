@@ -316,10 +316,46 @@ class Agent:
             data = extract_json(text)
         except ValueError as exc:
             return None, str(exc)
+        if self.spec.json_contract:
+            data = _coerce_contract(data, self.spec.json_contract)
         errors = validate_shape(data, self.spec.json_contract) if self.spec.json_contract else []
         if errors:
             return None, "; ".join(errors[:8])
         return data, ""
+
+
+# ---------------------------------------------------------------------------
+# contract coercion
+# ---------------------------------------------------------------------------
+
+
+def _coerce_contract(value: Any, schema: dict[str, Any]) -> Any:
+    """Absorb the contract slips models actually make before validating.
+
+    The repeated one is ``findings[].evidence``: the schema says string, the
+    model returns a list of quoted observations. Rejecting the whole payload
+    threw away an otherwise good bootstrap (facts + findings + assets), so a
+    list of scalars is joined rather than refused.
+    """
+    if not isinstance(schema, dict):
+        return value
+    expected = schema.get("type")
+    types = expected if isinstance(expected, list) else [expected] if expected else []
+    if "string" in types and isinstance(value, list):
+        parts = [str(item).strip() for item in value if str(item).strip()]
+        return "\n".join(parts)
+    if "string" in types and isinstance(value, (int, float)) and not isinstance(value, bool):
+        return str(value)
+    if "array" in types and not isinstance(value, list):
+        return [value] if value not in (None, "") else []
+    if isinstance(value, dict):
+        for key, subschema in (schema.get("properties") or {}).items():
+            if key in value:
+                value[key] = _coerce_contract(value[key], subschema)
+        return value
+    if isinstance(value, list) and isinstance(schema.get("items"), dict):
+        return [_coerce_contract(item, schema["items"]) for item in value]
+    return value
 
 
 # ---------------------------------------------------------------------------
