@@ -29,9 +29,11 @@ import hashlib
 import hmac
 import http.cookiejar
 import json
+import os
 import re
 import socket
 import ssl
+import subprocess
 import time
 import urllib.error
 import urllib.parse
@@ -43,9 +45,12 @@ from ..util import json_dumps, json_loads, now_iso, redact, truncate
 from .base import ToolContext, ToolRegistry, ToolResult, ToolSpec
 from . import browser as br
 from . import challenge as chal
+from . import stealth
 from . import jwtkeys
-from .net import (_ALLOWED_METHODS, DEFAULT_HTTP_TIMEOUT, MAX_HTTP_BYTES, _clean_headers,
-                  _decode_body, _response_headers, _save_evidence, _ScopedRedirectHandler)
+from .net import (_ALLOWED_METHODS, DEFAULT_HTTP_TIMEOUT, MAX_EVIDENCE_EXCERPT, MAX_HTTP_BYTES,
+                  _clean_headers,
+                  _decode_body, _redact_headers, _response_headers, _save_evidence,
+                  _ScopedRedirectHandler)
 from .terminal import audit, clamp_float, clamp_int
 
 #: Backends on which a real ``curl`` binary is reachable; others fall back to urllib.
@@ -228,22 +233,100 @@ def _session_headers(ctx: ToolContext, name: str) -> tuple[http.cookiejar.Mozill
     return _load_jar(ctx, name), dict((sessions.get(name) or {}).get("headers") or {})
 
 
+_REDIRECTS = (301, 302, 303, 307, 308)
+_MAX_HOPS = 5
+
+
 def _send(ctx: ToolContext, *, url: str, method: str = "GET", headers: dict[str, str] | None = None,
           body: str | None = None, session: str = "", follow: bool = False,
           timeout: float = DEFAULT_HTTP_TIMEOUT, max_bytes: int = 65536,
           jar: http.cookiejar.MozillaCookieJar | None = None, client: str = "",
           curl_extra: str = "") -> dict[str, Any]:
+    """One logical request: the transport, plus scope-checked redirects.
+
+    Redirects are followed here rather than inside the client so that every hop is
+    re-authorized (deny on an out-of-scope bounce), re-rate-limited and recorded —
+    libcurl and urllib would both follow silently otherwise.
+    """
+    row = _dispatch(ctx, url=url, method=method, headers=headers, body=body, session=session,
+                    follow=follow, timeout=timeout, max_bytes=max_bytes, jar=jar,
+                    client=client, curl_extra=curl_extra)
+    hops: list[dict[str, Any]] = []
+    current = url
+    for _ in range(_MAX_HOPS if follow else 0):
+        location = row.get("location") or ""
+        if (row.get("status") or 0) not in _REDIRECTS or not location:
+            break
+        target = urllib.parse.urljoin(current, location)
+        ctx.scope.require_url(target)          # raises ScopeViolation on a bounce out of scope
+        audit(ctx, "http_request", "redirect", target,
+              {"from": current, "status": row.get("status")})
+        hops.append({"from": current, "to": target, "status": row.get("status")})
+        if (row.get("status") or 0) in (301, 302, 303) and (row.get("method") or "GET") != "GET":
+            method = "GET"
+            body = None
+        current = target
+        row = _dispatch(ctx, url=target, method=method, headers=headers, body=body,
+                        session=session, follow=False, timeout=timeout, max_bytes=max_bytes,
+                        jar=jar, client=client, curl_extra=curl_extra)
+    row["redirects"] = hops
+    row["final_url"] = current
+    return row
+
+
+def _dispatch(ctx: ToolContext, *, url: str, method: str = "GET",
+              headers: dict[str, str] | None = None,
+              body: str | None = None, session: str = "", follow: bool = False,
+              timeout: float = DEFAULT_HTTP_TIMEOUT, max_bytes: int = 65536,
+              jar: http.cookiejar.MozillaCookieJar | None = None, client: str = "",
+              curl_extra: str = "") -> dict[str, Any]:
     """One scoped, rate-limited, bounded request. Never raises for 4xx/5xx.
 
     ``client='curl'`` shells out to curl when the sandbox is local: that buys
     HTTP/2, ALPN and a browser-ish TLS stack, which urllib cannot do. The scope
     check, rate limit, evidence and challenge detection are identical either way.
     """
-    if client == "curl" and getattr(ctx.sandbox, "backend", "") in _CURL_BACKENDS:
+    workdir = Path(ctx.workdir)
+    stealth_on = str(kwargs_client := client or "").lower() != "off" and \
+        os.environ.get("ARIAX_STEALTH", "1") != "0"
+
+    # Manner before content: the wall pushes back first on a host that keeps
+    # challenging, then on pace. Neither is a protocol error, so neither is raised.
+    host_for_pace = urllib.parse.urlsplit(url).hostname or ""
+    if stealth_on:
+        wait = stealth.breaker_open(workdir, host_for_pace)
+        if wait > 0:
+            time.sleep(min(wait, 15.0))
+            stealth.mark_paid(workdir)
+        kind = stealth.classify(url)
+        time.sleep(stealth.next_delay(workdir, kind,
+                                      scale=stealth.host_scale(workdir, host_for_pace)))
+    else:
+        kind = "api"
+
+    chosen = client.lower()
+    if chosen in {"", "auto"}:
+        chosen = "impersonate" if stealth.impersonate_python() else ""
+    if chosen == "impersonate":
+        result = _send_impersonate(ctx, url=url, method=method.upper(), headers=headers,
+                                   body=body, follow=False, timeout=timeout,
+                                   max_bytes=max_bytes, jar=jar)
+        if not result.get("transport_unavailable"):
+            if stealth_on:
+                stealth.record(workdir, url=url, kind=kind, status=result.get("status") or 0,
+                               size=result.get("length") or 0, elapsed_ms=result.get("ms") or 0,
+                               transport="impersonate", fingerprint="chrome/ja3+ja4+h2",
+                               challenge=(result.get("challenge") or {}).get("vendor", ""))
+            return result
+    if client.lower() == "curl" and getattr(ctx.sandbox, "backend", "") in _CURL_BACKENDS:
         result = _send_curl(ctx, url=url, method=method.upper(), headers=headers, body=body,
-                            follow=follow, timeout=timeout, max_bytes=max_bytes, jar=jar,
+                            follow=False, timeout=timeout, max_bytes=max_bytes, jar=jar,
                             extra=curl_extra)
         if not result.get("curl_unavailable"):
+            if stealth_on:
+                stealth.record(workdir, url=url, kind=kind, status=result.get("status") or 0,
+                               size=result.get("length") or 0, elapsed_ms=result.get("ms") or 0,
+                               transport="curl", fingerprint="schannel/ja3")
             return result
     method = method.upper()
     decision = ctx.scope.require_url(url, method)
@@ -252,9 +335,14 @@ def _send(ctx: ToolContext, *, url: str, method: str = "GET", headers: dict[str,
     audit(ctx, "http_request", "allowed", url,
           {"method": method, "host": host, "port": decision.port, "via": "auth"})
 
-    request_headers = {"User-Agent": "ARIA-X/0.1 (authorized security research)",
-                       "Accept": "*/*", "Accept-Encoding": "identity"}
+    # urllib cannot decode brotli; do not advertise it on that transport
+    polite = stealth.headers_for(workdir, url, method,
+                                 encodings="gzip, deflate") if stealth_on else {}
+    request_headers = {**polite}
     request_headers.update(_headers(headers, keep_host=True))
+    if not stealth_on:
+        request_headers.setdefault("User-Agent", "ARIA-X/0.1 (authorized security research)")
+        request_headers.setdefault("Accept", "*/*")
     data: bytes | None = None
     if body is not None and method not in {"GET", "HEAD"}:
         data = str(body).encode("utf-8")
@@ -322,6 +410,95 @@ def _send(ctx: ToolContext, *, url: str, method: str = "GET", headers: dict[str,
         row["challenge"] = flagged
         audit(ctx, "http_request", "challenge", url, {"vendor": flagged["vendor"],
                                                       "kind": flagged["kind"]})
+    if stealth_on:
+        stealth.record(workdir, url=url, kind=stealth.classify(url), status=status,
+                       size=len(raw), elapsed_ms=elapsed_ms, transport="urllib",
+                       fingerprint="python-ssl/ja3",
+                       challenge=(flagged or {}).get("vendor", ""))
+        row["transport"] = "urllib"
+        if status in (429, 503):
+            retry_after = response_headers.get("Retry-After", "")
+            try:
+                pause = min(float(retry_after), 30.0)
+            except (TypeError, ValueError):
+                pause = 0.0
+            if pause:
+                time.sleep(pause)
+    return row
+
+
+def _send_impersonate(ctx: ToolContext, *, url: str, method: str, headers: dict[str, str] | None,
+                      body: str | None, follow: bool, timeout: float, max_bytes: int,
+                      jar: http.cookiejar.MozillaCookieJar | None) -> dict[str, Any]:
+    """The request through libcurl-impersonate: Chrome's TLS and h2 fingerprint."""
+    python = stealth.impersonate_python()
+    if not python:
+        return {"transport_unavailable": True}
+    method = method.upper()
+    decision = ctx.scope.require_url(url, method)
+    host = decision.host or (urllib.parse.urlsplit(url).hostname or "")
+    ctx.scope.acquire_slot(host)
+    audit(ctx, "http_request", "allowed", url,
+          {"method": method, "host": host, "port": decision.port, "via": "impersonate"})
+
+    ordered = stealth.headers_for(Path(ctx.workdir), url, method)
+    ordered.update(_headers(headers, keep_host=True))
+    if jar is not None:
+        request = urllib.request.Request(url)
+        jar.add_cookie_header(request)
+        cookie = request.get_header("Cookie")
+        if cookie:
+            ordered.setdefault("Cookie", cookie)
+    worker = Path(__file__).with_name("_impersonate_worker.py")
+    spec = json.dumps({
+        "url": url, "method": method, "headers": list(ordered.items()),
+        "body_b64": base64.b64encode(body.encode()).decode() if body else "",
+        "timeout": timeout, "max_bytes": max_bytes, "follow": follow,
+        "impersonate": str(__import__("os").environ.get("ARIAX_IMPERSONATE") or "chrome"),
+    })
+    started = time.monotonic()
+    try:
+        run = subprocess.run([python, str(worker)], input=spec, capture_output=True, text=True,
+                             timeout=timeout + 20)
+    except (OSError, subprocess.SubprocessError) as exc:
+        return {"transport_unavailable": True, "error": f"impersonate unavailable: {exc}"}
+    try:
+        payload = json.loads(run.stdout or "{}")
+    except ValueError:
+        return {"transport_unavailable": True, "error": "impersonate worker returned no JSON"}
+    if payload.get("error"):
+        row: dict[str, Any] = {"url": url, "method": method, "status": 0,
+                              "error": str(payload["error"])[:300],
+                              "ms": int((time.monotonic() - started) * 1000)}
+        return row
+
+    raw = base64.b64decode(payload.get("body_b64") or "")
+    response_headers = {str(k): str(v) for k, v in (payload.get("headers") or {}).items()}
+    lower = {k.lower(): v for k, v in response_headers.items()}
+    body_text = _decode_body(raw, response_headers.get("Content-Type", ""))
+    if jar is not None:
+        for value in ([lower.get("set-cookie")] if lower.get("set-cookie") else []):
+            for piece in re.split(r",(?=[^;]+=)", str(value)):
+                name, _, val = piece.partition("=")
+                if name.strip():
+                    parts = urllib.parse.urlsplit(url)
+                    jar.set_cookie(http.cookiejar.Cookie(
+                        version=0, name=name.strip(), value=val.split(";")[0].strip(), port=None,
+                        port_specified=False, domain=parts.hostname or "",
+                        domain_specified=False, domain_initial_dot=False, path="/",
+                        path_specified=True, secure=parts.scheme == "https", expires=None,
+                        discard=True, comment=None, comment_url=None, rest={}, rfc2109=False))
+    row = {
+        "url": url, "method": method, "status": int(payload.get("status") or 0),
+        "ms": int(payload.get("elapsed_ms") or 0), "length": len(raw),
+        "content_type": lower.get("content-type", ""), "location": lower.get("location", ""),
+        "www_authenticate": lower.get("www-authenticate", ""),
+        "set_cookie": bool(lower.get("set-cookie")), "body_sha": _sha(body_text),
+        "body": body_text, "headers": response_headers, "transport": "impersonate",
+    }
+    flagged = chal.detect(row["status"], response_headers, body_text)
+    if flagged:
+        row["challenge"] = flagged
     return row
 
 
@@ -425,6 +602,48 @@ def _send_curl(ctx: ToolContext, *, url: str, method: str, headers: dict[str, st
     if flagged:
         row["challenge"] = flagged
     return row
+
+
+def row_payload(ctx: ToolContext, row: dict[str, Any], *, headers: dict[str, str] | None = None,
+                body: str | None = None) -> dict[str, Any]:
+    """Assemble the ``http_request``-shaped payload (and evidence) from a row.
+
+    ``net.http_request`` funnels through this so the plain tool inherits the same
+    persona headers, pacing, fingerprint transport and ledger as everything else.
+    """
+    status = int(row.get("status") or 0)
+    text_body = row.get("body") or ""
+    excerpt = truncate(text_body, MAX_EVIDENCE_EXCERPT)
+    payload: dict[str, Any] = {
+        "url": row.get("url"), "final_url": row.get("url"), "method": row.get("method"),
+        "status": status,
+        "reason": "ok" if 200 <= status < 300 else ("redirect" if 300 <= status < 400 else "error"),
+        "ok": 200 <= status < 300,
+        "headers": {k: v for k, v in (row.get("headers") or {}).items()},
+        "body_excerpt": excerpt, "body_length": row.get("length") or 0,
+        "truncated": bool(row.get("truncated")), "elapsed_ms": row.get("ms") or 0,
+        "server": (row.get("headers") or {}).get("Server", ""),
+        "content_type": row.get("content_type") or "",
+        "redirect": row.get("location") or "", "redirects": [],
+        "transport": row.get("transport") or "",
+    }
+    if row.get("challenge"):
+        payload["challenge"] = chal.describe(row["challenge"])
+    if row.get("error"):
+        payload["error"] = row["error"]
+    evidence = _save_evidence(ctx, {
+        "request": {"url": row.get("url"), "method": row.get("method"),
+                    "headers": _redact_headers(headers or {}),
+                    "body_excerpt": truncate(redact(str(body or "")), 2000)},
+        "response": {"status": status, "headers": row.get("headers") or {},
+                     "body_excerpt": truncate(redact(excerpt), MAX_EVIDENCE_EXCERPT),
+                     "length": row.get("length") or 0, "truncated": bool(row.get("truncated"))},
+        "transport": row.get("transport") or "", "elapsed_ms": row.get("ms") or 0,
+        "challenge": row.get("challenge"),
+    }, prefix="http")
+    if evidence:
+        payload["evidence_path"] = evidence
+    return payload
 
 
 def _row_summary(row: dict[str, Any], body_chars: int = 400) -> dict[str, Any]:
@@ -1731,6 +1950,107 @@ def jwt_sign(ctx: ToolContext, kwargs: dict[str, Any]) -> ToolResult:
     return ToolResult.success(payload, text=text)
 
 
+
+
+# ---------------------------------------------------------------------------
+# tools: stealth audit
+# ---------------------------------------------------------------------------
+
+
+def stealth_audit(ctx: ToolContext, kwargs: dict[str, Any]) -> ToolResult:
+    """Report what the traffic actually looked like, and what could still betray it."""
+    report = stealth.audit(Path(ctx.workdir))
+    if kwargs.get("reset"):
+        stealth.save(Path(ctx.workdir), {"persona": report.get("persona") or "chrome",
+                                        "since": time.time(), "requests": 0, "bytes": 0,
+                                        "by_class": {}, "challenges": 0, "rate_limited": 0,
+                                        "hosts": {}})
+    lines = [f"persona {report['persona'] or '(none)'} · transport {report['transport'] or '-'}"
+             f" · fingerprint {report['fingerprint'] or '-'}",
+             f"{report['requests']} requests / {report['bytes']} bytes "
+             f"· challenges {report['challenges']} · 429s {report['rate_limited']}"]
+    for kind, row in sorted((report.get("by_class") or {}).items()):
+        lines.append(f"  {kind:<9} {row['requests']:>4} req {row['bytes']:>9} B")
+    for host, row in sorted((report.get("hosts") or {}).items()):
+        lines.append(f"  host {host}: {row['requests']} req, {row['challenges']} challenge, "
+                     f"{row['rate_limited']} rate-limited")
+    lines.append("capabilities: " + "; ".join(f"{k}={v}" for k, v in
+                                              report["capabilities"].items() if k != "worker"))
+    lines.append("residual risks:")
+    lines += [f"  - {risk}" for risk in report["residual_risks"]]
+    evidence = _save_evidence(ctx, report, prefix="stealth")
+    payload = dict(report)
+    if evidence:
+        payload["evidence_path"] = evidence
+    return ToolResult.success(payload, text="\n".join(lines))
+
+
+
+
+# ---------------------------------------------------------------------------
+# tools: escalating fetch (the ladder, as one call)
+# ---------------------------------------------------------------------------
+
+
+def http_fetch(ctx: ToolContext, kwargs: dict[str, Any]) -> ToolResult:
+    """Fetch a URL, escalating only as far as the wall demands.
+
+    fingerprint transport → headless browser → give up with a reason. Each rung is
+    quieter than the next, so the default is the cheapest thing that works: an
+    impersonated GET for a normal site, a browser only when the response is a
+    challenge. That is the whole point — stealth is not one setting.
+    """
+    url = str(kwargs.get("url") or "").strip()
+    if not url:
+        return ToolResult.failure("url is required")
+    method = str(kwargs.get("method") or "GET").upper()
+    rungs: list[dict[str, Any]] = []
+
+    first = _send(ctx, url=url, method=method, headers=_headers(kwargs.get("headers")),
+                  body=kwargs.get("body"), timeout=clamp_float(kwargs.get("timeout"), 1, 90, 20),
+                  max_bytes=clamp_int(kwargs.get("max_bytes"), 256, MAX_HTTP_BYTES, 131072))
+    rungs.append({"rung": "http", "transport": first.get("transport") or "urllib",
+                  "status": first.get("status"), "wall": chal.describe(first.get("challenge"))
+                  if first.get("challenge") else ""})
+    if first.get("status") and not first.get("challenge"):
+        payload = row_payload(ctx, first, headers=kwargs.get("headers"), body=kwargs.get("body"))
+        payload["rungs"] = rungs
+        return ToolResult.success(payload, text=f"HTTP {first.get('status')} via "
+                                                f"{first.get('transport') or 'urllib'}"
+                                                f"\n\n{payload['body_excerpt'][:1500]}")
+    if first.get("error") and not first.get("status"):
+        return ToolResult.failure(f"fetch failed: {first['error']}", data={"rungs": rungs})
+
+    if str(kwargs.get("escalate") or "browser") != "browser":
+        payload = row_payload(ctx, first, headers=kwargs.get("headers"), body=kwargs.get("body"))
+        payload["rungs"] = rungs
+        return ToolResult.success(payload, text=f"HTTP {first.get('status')} walled, "
+                                                f"escalation disabled\nrungs: {rungs}")
+
+    session_name = f"fetch_{int(time.time() * 1000)}"
+    browser = browser_session(ctx, {"action": "open", "url": url,
+                                   "wait": clamp_float(kwargs.get("wait"), 0, 120, 25),
+                                   "import_to": session_name,
+                                   "max_chars": clamp_int(kwargs.get("max_chars"), 200, 20000, 4000)})
+    rungs.append({"rung": "browser", "transport": "chrome",
+                  "status": "ok" if browser.ok else "error",
+                  "wall": (browser.data or {}).get("challenge", ""),
+                  "cleared": (browser.data or {}).get("cleared")})
+    if not browser.ok:
+        return ToolResult.failure(f"escalation failed: {browser.error}", data={"rungs": rungs})
+    payload = {"url": url, "title": (browser.data or {}).get("title"),
+               "final_url": (browser.data or {}).get("final_url"),
+               "html_bytes": (browser.data or {}).get("html_bytes"),
+               "excerpt": (browser.data or {}).get("excerpt"),
+               "cookies": (browser.data or {}).get("imported_cookies"),
+               "session": session_name, "rungs": rungs,
+               "evidence_path": (browser.data or {}).get("evidence_path")}
+    return ToolResult.success(payload, text=truncate(
+        f"walled for HTTP, cleared by the browser after {len(rungs)} rung(s); "
+        f"cookies {payload['cookies']} in session '{session_name}'\n\n"
+        f"{payload['excerpt']}", 9000))
+
+
 # ---------------------------------------------------------------------------
 # registration
 # ---------------------------------------------------------------------------
@@ -1950,3 +2270,32 @@ def register(registry: ToolRegistry) -> None:
             "required": ["alg", "claims"]},
         risk="low", tags=("auth", "jwt"), read_only=False,
     ), jwt_sign)
+
+    registry.add(ToolSpec(
+        name="stealth_audit",
+        description=(
+            "Report the stealth posture: persona, transport, fingerprint, requests and bytes per "
+            "request class, challenges and 429s per host, available capabilities, and the residual "
+            "risks that remain. Cite it in the report instead of asserting invisibility."
+        ),
+        parameters={"type": "object", "properties": {"reset": {"type": "boolean"}}},
+        risk="low", tags=("stealth", "audit"), read_only=False,
+    ), stealth_audit)
+
+    registry.add(ToolSpec(
+        name="http_fetch",
+        description=(
+            "Fetch one in-scope URL with escalation: impersonated Chrome fingerprint first, headless "
+            "browser only if the response is a wall, then a reason if neither works. Returns the body "
+            "and the rungs used. Prefer this over http_request when the host is known to be defended."
+        ),
+        parameters={"type": "object", "properties": {
+            "url": {"type": "string"}, "method": {"type": "string"},
+            "headers": {"type": "object", "additionalProperties": {"type": "string"}},
+            "body": {"type": "string"}, "wait": {"type": "number"},
+            "max_chars": {"type": "integer"}, "max_bytes": {"type": "integer"},
+            "timeout": {"type": "number"},
+            "escalate": {"type": "string", "enum": ["browser", "none"]}},
+            "required": ["url"]},
+        risk="medium", tags=("network", "http", "stealth", "escalation"), requires_scope=True,
+    ), http_fetch)

@@ -59,6 +59,7 @@ RECON_TOOLS: tuple[str, ...] = (
     "vault",
     "jwt_sign",
     "browser_session",
+    "stealth_audit",
 )
 
 #: Tools that mutate the blackboard / asset graph. Workers own these.

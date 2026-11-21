@@ -50,6 +50,8 @@ class AuthToolTests(unittest.TestCase):
         cls.thread.join(timeout=5)
 
     def setUp(self) -> None:
+        # keep the suite fast: stealth stays ON, its delays are scaled right down
+        __import__("os").environ.setdefault("ARIAX_STEALTH_SCALE", "0.02")
         self._tmp = tempfile.TemporaryDirectory()
         self.workdir = Path(self._tmp.name) / "work"
         self.workdir.mkdir(parents=True, exist_ok=True)

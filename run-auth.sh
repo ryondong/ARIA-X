@@ -3,6 +3,7 @@
 #
 #   ./run-auth.sh lab                     # start the vulnerable lab on :8899
 #   ./run-auth.sh verify                  # score the auth capability, no model, no key
+#   ./run-auth.sh verify-stealth          # measure the fingerprint ladder against a TLS echo
 #   ./run-auth.sh goals                   # list goal templates
 #   ./run-auth.sh goal auth-presence      # one bounded auth run against the lab
 #   ./run-auth.sh suite                   # verify, then every goal, then summarise
@@ -30,6 +31,8 @@ case "${1:-}" in
     shift; exec python lab/lab_app.py --port "${PORT:-8899}" "$@" ;;
   verify)
     shift; exec python lab/verify_auth_capability.py "$@" ;;
+  verify-stealth)
+    shift; exec python lab/verify_stealth.py "$@" ;;
   goals)
     shift
     printf '%-22s %s\n' NAME FIRST-LINE

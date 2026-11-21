@@ -276,16 +276,45 @@ def _http_request(ctx: ToolContext, *, method: str, url: str, headers: dict[str,
 
 
 def http_request(ctx: ToolContext, kwargs: dict[str, Any]) -> ToolResult:
+    """One request, executed by the auth lane so it inherits the stealth posture.
+
+    The lane is a superset of this tool (persona headers, pacing, optional
+    fingerprint transport, ledger, challenge detection), so delegation keeps a
+    single code path instead of two drifting ones. ``ARIAX_STEALTH=0`` restores
+    the raw behaviour.
+    """
     url = str(kwargs.get("url") or "").strip()
     if not url:
         return ToolResult.failure("url is required")
     method = str(kwargs.get("method") or "GET").upper()
+    if method not in _ALLOWED_METHODS:
+        return ToolResult.failure(f"unsupported HTTP method '{method}'",
+                                  data={"allowed": sorted(_ALLOWED_METHODS)})
     timeout = clamp_float(kwargs.get("timeout"), 1.0, 90.0, DEFAULT_HTTP_TIMEOUT)
     max_bytes = clamp_int(kwargs.get("max_bytes"), 256, MAX_HTTP_BYTES, 65536)
     headers = kwargs.get("headers") if isinstance(kwargs.get("headers"), dict) else {}
     body = kwargs.get("body")
-    return _http_request(ctx, method=method, url=url, headers=headers, body=body,
-                         timeout=timeout, max_bytes=max_bytes, save_evidence=True)
+    from . import auth as auth_lane
+
+    # upstream semantics: this tool follows redirects (each hop still scope-checked)
+    row = auth_lane._send(ctx, url=url, method=method, headers=headers, body=body,
+                          timeout=timeout, max_bytes=max_bytes, follow=True,
+                          client=str(kwargs.get("client") or ""))
+    audit(ctx, "http_request", "completed", url,
+          {"status": row.get("status") or 0, "bytes": row.get("length") or 0,
+           "elapsed_ms": row.get("ms") or 0})
+    if row.get("error") and not row.get("status"):
+        audit(ctx, "http_request", "error", url, {"error": row["error"]})
+        return ToolResult.failure(f"request failed: {row['error']}",
+                                  data={"url": url, "method": method})
+    payload = auth_lane.row_payload(ctx, row, headers=headers, body=body)
+    status = payload["status"]
+    text = (f"HTTP {status} {method} {url} ({payload['body_length']} bytes, "
+            f"{payload['elapsed_ms']} ms)\ncontent-type: {payload['content_type'] or 'n/a'}\n\n"
+            f"{payload['body_excerpt']}")
+    return ToolResult.success(payload, text=truncate(text, 10000),
+                              artifacts=[payload["evidence_path"]] if payload.get("evidence_path")
+                              else None)
 
 
 def dns_lookup(ctx: ToolContext, kwargs: dict[str, Any]) -> ToolResult:

@@ -26,6 +26,8 @@ Faults planted (see lab/README.md for the probe that proves each):
   L17 local solver stand-in (returns tok-<sitekey>)      POST /solver
   L18 RS256 JWT whose verifier trusts the header's alg   GET  /api/rs/me
   L19 JS challenge wall that sets a clearance cookie     GET  /js/{code}
+  L20 header echo (order preserved) for persona checks   GET  /echo
+  L21 429 with Retry-After for backoff checks            GET  /slow429
 """
 
 from __future__ import annotations
@@ -249,6 +251,12 @@ class Handler(BaseHTTPRequestHandler):
             return self.otp(path.rsplit("/", 1)[1])
         if path.startswith("/secure/"):
             return self.secure(path.rsplit("/", 1)[1])
+        if path == "/echo":
+            return self.send(200, json.dumps({"headers": list(self.headers.items()),
+                                              "path": self.path}), "application/json")
+        if path == "/slow429":
+            return self.send(429, '{"error":"slow down"}', "application/json",
+                             {"Retry-After": "1"})
         if path == "/api/rs/token":
             who = query.get("user", "alice")
             if who not in USERS:
@@ -304,6 +312,12 @@ class Handler(BaseHTTPRequestHandler):
             return self.otp(path.rsplit("/", 1)[1])
         if path.startswith("/secure/"):
             return self.secure(path.rsplit("/", 1)[1])
+        if path == "/echo":
+            return self.send(200, json.dumps({"headers": list(self.headers.items()),
+                                              "path": self.path}), "application/json")
+        if path == "/slow429":
+            return self.send(429, '{"error":"slow down"}', "application/json",
+                             {"Retry-After": "1"})
         if path == "/api/rs/token":
             who = query.get("user", "alice")
             if who not in USERS:

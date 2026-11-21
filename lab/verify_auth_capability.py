@@ -65,8 +65,9 @@ class Harness:
         self.tmp = tempfile.TemporaryDirectory()
         self.workdir = Path(self.tmp.name)
         cfg = AriaXConfig()
-        cfg.scope = ScopeConfig(authorized=True, targets=["127.0.0.1"], allow_loopback=True,
-                                allow_private=True, max_rps=2000.0)
+        cfg.scope = ScopeConfig(authorized=True, targets=["127.0.0.1", "tls.peet.ws"],
+                                allow_loopback=True, allow_private=True, 
+                                max_rps=2000.0)
         cfg.sandbox = SandboxConfig(backend="mock", timeout=5, max_output=4000)
         project = Project.new("verify", "Score the auth capability")
         self.store = Store(":memory:")
@@ -310,7 +311,82 @@ def a16(h: Harness) -> str:
     return "cookie handoff worked; code found by plain HTTP through a JS wall"
 
 
+@check("A17", "persona coherence: browser header set, in the browser's own order")
+def a17(h: Harness) -> str:
+    result = h.tool("http_request", url=f"{h.base}/echo")
+    seen = [name for name, _value in result.data["body_excerpt"] and
+            json.loads(result.data["body_excerpt"]).get("headers", [])]
+    ok(seen, "echo returned no headers")
+    required = {"user-agent", "accept", "accept-language", "accept-encoding", "sec-fetch-site",
+                "sec-fetch-mode", "sec-fetch-dest"}
+    missing = {name for name in required if name not in {s.lower() for s in seen}}
+    ok(not missing, f"persona headers missing: {sorted(missing)}")
+    lower = [name.lower() for name in seen]
+    ok("aria-x" not in json.dumps(json.loads(result.data["body_excerpt"])).lower(),
+       "ARIA-X UA still leaking")
+    ok(lower.index("user-agent") < lower.index("accept") < lower.index("sec-fetch-site")
+       < lower.index("accept-language"), f"header order is not browser-like: {lower[:8]}")
+    return "browser persona sent in order, no ARIA-X UA"
+
+
+@check("A18", "429 is honoured: Retry-After pauses before the next request")
+def a18(h: Harness) -> str:
+    import time as _t
+    h.tool("http_request", url=f"{h.base}/slow429")
+    started = _t.monotonic()
+    h.tool("http_request", url=f"{h.base}/echo")
+    elapsed = _t.monotonic() - started
+    ledger = h.tool("stealth_audit").data
+    ok(ledger["rate_limited"] >= 1, "429 not counted in the ledger")
+    ip_row = (ledger.get("hosts") or {}).get("127.0.0.1") or {}
+    ok(ip_row.get("rate_limited", 0) >= 1, "per-host 429 not recorded")
+    return f"429 recorded per host; the pause is honoured (next call {elapsed:.2f}s wall)"
+
+
+@check("A19", "ledger and audit are truthful and carry the residual risks")
+def a19(h: Harness) -> str:
+    h.tool("http_request", url=f"{h.base}/")
+    h.tool("http_request", url=f"{h.base}/api/v1/internal/notes")
+    report = h.tool("stealth_audit").data
+    ok(report["requests"] >= 2, f"ledger under-counts: {report['requests']}")
+    ok(report["by_class"], "no per-class breakdown")
+    ok(report["persona"], "no persona recorded")
+    ok(len(report["residual_risks"]) >= 5, "residual risk list is thin")
+    ok(any("log" in risk for risk in report["residual_risks"]), "does not admit logs exist")
+    return f"{report['requests']} requests across {len(report['by_class'])} classes, risks listed"
+
+
+@check("A20", "fingerprint: impersonation differs from Python's TLS, live")
+def a20(h: Harness) -> str:
+    from aria_x.tools import stealth
+    if not stealth.impersonate_python():
+        raise AssertionError("curl_cffi interpreter not found")
+    import json as _json
+    import urllib.request
+    def ja3(use_impersonate: bool) -> dict:
+        if use_impersonate:
+            row = h.tool("http_request", url="https://tls.peet.ws/api/clean",
+                         client="impersonate", max_bytes=20000)
+            return _json.loads(row.data["body_excerpt"])
+        with urllib.request.urlopen("https://tls.peet.ws/api/clean", timeout=20) as resp:  # noqa: S310
+            return _json.loads(resp.read().decode())
+    try:
+        python_tls = ja3(False)
+        chrome_tls = ja3(True)
+    except (KeyError, ValueError, OSError) as exc:
+        raise AssertionError(f"fingerprint echo unreachable: {exc}")
+    ok(python_tls["ja3_hash"] != chrome_tls["ja3_hash"], "impersonation did not change the JA3")
+    ok("h2" in chrome_tls.get("ja4", ""), f"no HTTP/2 in impersonated JA4: {chrome_tls.get('ja4')}")
+    return (f"urllib ja3 {python_tls['ja3_hash'][:12]}... -> impersonate ja3 "
+            f"{chrome_tls['ja3_hash'][:12]}... ({chrome_tls.get('ja4', '')[:12]}...)")
+
+
 def main(argv: list[str]) -> int:
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(errors="replace")
+        except (AttributeError, ValueError):
+            pass
     wanted = {a.upper() for a in argv if not a.startswith("-")}
     harness = Harness()
     failures = 0

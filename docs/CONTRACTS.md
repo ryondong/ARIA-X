@@ -173,9 +173,21 @@ Register exactly these names via `build_registry(ctx)` in `tools/builtin.py`:
   - `vault(action, name?, value?, reveal?)` — run-scoped secret store under `workdir/state/vault.json`.
   - `jwt_sign(alg, claims, key_pem?, key_file?, hmac_secret?, header?, verify?)` — alg none/HS*/RS*/ES256,
     pure stdlib; `HS*` with a public key PEM *is* algorithm confusion.
+  - `http_fetch(url, method?, escalate?)` — the ladder as one call: impersonated fetch, browser only
+    if the response is a wall, then a reason. Each redirect hop is scope-checked.
+  - `stealth_audit(reset?)` — persona, transport, bytes/requests per class, challenges per host,
+    capabilities and residual risks.
   - `browser_session(action, url?, wait?, import_to?, expression?, host?)` — headless Chrome over CDP;
     the only lane that clears a js-challenge (it runs the page's own script), returns the rendered DOM
     and can harvest the minted cookies into a session jar. Target navigations are scope-checked.
+- **Stealth lane (`tools/stealth.py`).** Every request gets a persona's browser header set in
+  browser order (UA, `sec-ch-ua*`, `sec-fetch-*`, `Accept-Language`), a class-scaled jittered delay,
+  and the cheapest transport that survives: `urllib` → `curl_cffi` impersonation (Chrome JA4 + Akamai h2
+  fingerprint, executed by `_impersonate_worker.py` under a venv interpreter) → headless browser.
+  `Retry-After` is honoured, a per-host slowdown ladder applies after 429s, and a circuit breaker opens
+  after three challenges. Every request is ledgered (`workdir/state/stealth.json`); `stealth_audit`
+  reports the posture and the residual risks. `ARIAX_STEALTH=0` disables it, `ARIAX_STEALTH_SCALE`
+  scales delays, `ARIAX_IMPERSONATE` picks the target profile.
 - **Bot-management lane (`tools/challenge.py`).** Every `_send` runs `challenge.detect()` on the
   response and attaches `challenge={vendor, kind, status, marker, sitekey, token_field, clearance_cookie,
   reaction}`; a 200 carrying a widget is therefore never silently read as content. `http_session`,
