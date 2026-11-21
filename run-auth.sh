@@ -19,6 +19,12 @@ if [ -z "${ARIAX_SOLVER_URL:-}" ] && [ -z "${ARIAX_CAPTCHA_KEY:-}" ]; then
   export ARIAX_SOLVER_URL="http://127.0.0.1:${PORT:-8899}/solver"
 fi
 
+# Chrome instances we launched are killed by profile path, never the operator's own.
+close_browsers() {
+  [ "${ARIAX_KEEP_BROWSER:-0}" = "1" ] && return 0
+  powershell -NoProfile -Command     "Get-CimInstance Win32_Process -Filter \"Name='chrome.exe'\" | Where-Object { \$_.CommandLine -like '*aria-x*profile_*' } | ForEach-Object { Stop-Process -Id \$_.ProcessId -Force -ErrorAction SilentlyContinue }"     >/dev/null 2>&1 || true
+}
+
 case "${1:-}" in
   lab)
     shift; exec python lab/lab_app.py --port "${PORT:-8899}" "$@" ;;
@@ -37,7 +43,9 @@ case "${1:-}" in
     file="goals/${name}.md"
     [ -f "$file" ] || { echo "no such goal: $name" >&2; exit 2; }
     goal="$(sed '/^$/d' "$file")"
-    exec python -m aria_x -c configs/auth-lane.toml run --name "auth:$name" --goal "$goal" "$@" ;;
+    python -m aria_x -c configs/auth-lane.toml run --name "auth:$name" --goal "$goal" "$@"
+    close_browsers ;;
+
   suite)
     shift
     python lab/verify_auth_capability.py

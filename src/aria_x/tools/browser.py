@@ -279,6 +279,18 @@ def connect(workdir: Path) -> _WS:
     return _WS("127.0.0.1", int(state["port"]), state["browser_ws"])
 
 
+def _alive(pid: int) -> bool:
+    if os.name == "nt":
+        out = subprocess.run(["tasklist", "/FI", f"PID eq {pid}", "/NH"],
+                             capture_output=True, text=True)
+        return str(pid) in (out.stdout or "")
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
 def _kill(pid: int | None) -> bool:
     if not pid:
         return False
@@ -293,6 +305,27 @@ def _kill(pid: int | None) -> bool:
         return False
 
 
+def kill_under(workdir: Path) -> int:
+    """Kill every chrome whose profile lives under ``workdir`` (state file or not).
+
+    Teardown cannot rely on ``state/browser.json`` alone: a failed launch or an
+    early error can leave processes behind after the state file is gone, and each
+    one pins ~9 OS processes plus its profile directory.
+    """
+    if os.name != "nt":
+        return 0
+    needle = str(Path(workdir).resolve()).replace("\\", "\\")
+    script = ("Get-CimInstance Win32_Process -Filter \"Name='chrome.exe'\" | "
+              "Where-Object { $_.CommandLine -like '*" + needle + "*profile_*' } | "
+              "ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }")
+    try:
+        subprocess.run(["powershell", "-NoProfile", "-Command", script],
+                       capture_output=True, timeout=30)
+        return 1
+    except (OSError, subprocess.SubprocessError):
+        return 0
+
+
 def shutdown(workdir: Path) -> bool:
     state = read_state(workdir)
     pid = state.get("pid")
@@ -300,7 +333,11 @@ def shutdown(workdir: Path) -> bool:
     killed = False
     killed = _kill(int(pid) if pid else None)
     _state_file(workdir).unlink(missing_ok=True)
-    time.sleep(0.6)  # let Windows release the profile handles before rmtree
+    for _ in range(30):  # wait for the handles to drop before deleting the profile
+        if not pid or not _alive(int(pid)):
+            break
+        time.sleep(0.1)
+    kill_under(workdir)
     if profile:
         shutil.rmtree(profile, ignore_errors=True)
     return killed

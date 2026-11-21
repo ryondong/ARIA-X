@@ -71,6 +71,12 @@ class AuthToolTests(unittest.TestCase):
         lab_app.RESET_CODES.clear()
 
     def tearDown(self) -> None:
+        # a browser left running holds the profile and ~9 chrome processes
+        try:
+            from aria_x.tools import browser
+            browser.shutdown(self.workdir)
+        except Exception:  # noqa: BLE001 - teardown must not mask the real failure
+            pass
         self.store.close()
         self._tmp.cleanup()
 
