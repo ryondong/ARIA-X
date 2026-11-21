@@ -188,6 +188,13 @@ Register exactly these names via `build_registry(ctx)` in `tools/builtin.py`:
   after three challenges. Every request is ledgered (`workdir/state/stealth.json`); `stealth_audit`
   reports the posture and the residual risks. `ARIAX_STEALTH=0` disables it, `ARIAX_STEALTH_SCALE`
   scales delays, `ARIAX_IMPERSONATE` picks the target profile.
+- **Egress lane (`tools/egress.py`).** `ARIAX_PROXIES` / `ARIAX_PROXY_FILE` feed a pool; assignment is
+  sticky per host, `ARIAX_EGRESS=distinct` gives every host its own slot (multi-host runs), `rotate`
+  picks per request, `off` forces direct. A failed egress is parked for five minutes and the request is
+  retried once elsewhere. `ARIAX_PROXY_PROVIDER` (brightdata|oxylabs|decodo|iproyal|soax|custom) builds
+  the pool from `ARIAX_PROXY_USER/PASS` + `ARIAX_PROXY_SESSIONS` sticky slots and `ARIAX_PROXY_COUNTRY`.
+  `egress` (status/rotate/check) is the audit surface; credentials are masked greedily to the last `@`.
+  The browser takes `--proxy-server` at launch, so rotate before reopening it.
 - **Bot-management lane (`tools/challenge.py`).** Every `_send` runs `challenge.detect()` on the
   response and attaches `challenge={vendor, kind, status, marker, sitekey, token_field, clearance_cookie,
   reaction}`; a 200 carrying a widget is therefore never silently read as content. `http_session`,

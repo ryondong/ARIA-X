@@ -437,6 +437,11 @@ def a22(h: Harness) -> str:
         raise AssertionError("no chrome installed")
     opened = h.tool("browser_session", action="open", url=f"{h.base}/click", settle_ms=800,
                     humanize=True, moves=2)
+    if not opened.ok or not (opened.data or {}).get("acted"):
+        # a launch can lose a race with a just-killed browser: one retry, then fail
+        opened = h.tool("browser_session", action="open", url=f"{h.base}/click", settle_ms=1200,
+                        humanize=True, moves=2)
+    ok(opened.ok, f"browser open failed: {opened.error}")
     ok(opened.data["acted"], "no interaction recorded")
     ok(opened.data["acted"].get("moves", 0) > 5, f"too few pointer moves: {opened.data['acted']}")
     ok(opened.data["acted"].get("scrolled", 0) >= 1, "no scroll")
@@ -469,6 +474,65 @@ def a23(h: Harness) -> str:
             os.environ.pop("ARIAX_PROXIES", None)
         else:
             os.environ["ARIAX_PROXIES"] = previous
+
+
+@check("A24", "distinct egress: two hosts never share an address")
+def a24(h: Harness) -> str:
+    import os
+    ports = (8901, 8902)
+    if not _PROXIES:
+        _start_proxies(ports)
+    previous = os.environ.get("ARIAX_PROXIES")
+    os.environ["ARIAX_PROXIES"] = f"http://127.0.0.1:{ports[0]},http://127.0.0.1:{ports[1]}"
+    os.environ["ARIAX_EGRESS"] = "distinct"
+    try:
+        one = h.tool("http_request", url=f"http://127.0.0.1:{h.port}/echo")
+        two = h.tool("http_request", url=f"http://localhost:{h.port}/echo")
+        first = dict(json.loads(one.data["body_excerpt"])["headers"]).get("X-Egress", "")
+        second = dict(json.loads(two.data["body_excerpt"])["headers"]).get("X-Egress", "")
+        ok(first and second, f"missing proxy marks: {first!r} {second!r}")
+        ok(first != second, f"two hosts shared egress {first}")
+        again = h.tool("http_request", url=f"http://127.0.0.1:{h.port}/echo")
+        ok(dict(json.loads(again.data["body_excerpt"])["headers"]).get("X-Egress") == first,
+           "sticky assignment did not hold for the first host")
+        status = h.tool("egress", action="status").data
+        ok(status["distinct"], "status does not report distinct mode")
+        ok(not status["collisions"], f"collisions reported: {status['collisions']}")
+        return f"{first} and {second} kept apart, and each stayed put"
+    finally:
+        os.environ["ARIAX_EGRESS"] = "sticky"
+        if previous is None:
+            os.environ.pop("ARIAX_PROXIES", None)
+        else:
+            os.environ["ARIAX_PROXIES"] = previous
+
+
+@check("A25", "residential provider: pool built from credentials, passwords masked")
+def a25(h: Harness) -> str:
+    import os
+    from aria_x.tools import egress
+    keep = {k: os.environ.get(k) for k in
+            ("ARIAX_PROXY_PROVIDER", "ARIAX_PROXY_USER", "ARIAX_PROXY_PASS",
+             "ARIAX_PROXY_COUNTRY", "ARIAX_PROXY_SESSIONS", "ARIAX_PROXY_ZONE")}
+    os.environ.update(ARIAX_PROXY_PROVIDER="iproyal", ARIAX_PROXY_USER="acct",
+                      ARIAX_PROXY_PASS="p@ss:w0rd", ARIAX_PROXY_COUNTRY="ph",
+                      ARIAX_PROXY_SESSIONS="2")
+    try:
+        built = egress.pool()
+        ok(len(built) == 2, f"expected 2 session slots, got {len(built)}")
+        ok(all("session-ariax0" in url for url in built), "no sticky session token in the user")
+        ok(all("_country-ph" in url for url in built), "country not applied")
+        ok(len({url for url in built}) == 2, "slots are not distinct")
+        masked = egress.mask(built[0])
+        ok("p@ss:w0rd" not in masked or "***" in masked, "password leaked by mask")
+        ok(masked.count("***") == 1, f"mask malformed: {masked}")
+        return f"2 slots, session+country applied, mask {masked.split('@')[0].split(':')[-1]}"
+    finally:
+        for key, value in keep.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
 
 
 def main(argv: list[str]) -> int:

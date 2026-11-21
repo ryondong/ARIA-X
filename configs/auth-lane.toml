@@ -69,3 +69,12 @@ language = "en"
 bootstrap = true
 max_idle_rounds = 2
 require_finding_for_completion = true
+
+# 出口池（环境变量，勿写入提交配置）。留空 = 直连。
+#   ARIAX_PROXIES=http://u:p@127.0.0.1:8901,http://127.0.0.1:8902
+#   ARIAX_PROXY_FILE=~/proxies.txt            # 每行一个，替代上面的行内列表
+#   ARIAX_EGRESS=sticky | distinct | rotate | off
+#   住宅/移动（换 ASN，只有它们换 ASN）：
+#   ARIAX_PROXY_PROVIDER=iproyal|oxylabs|decodo|brightdata|soax|custom
+#   ARIAX_PROXY_USER=... ARIAX_PROXY_PASS=... ARIAX_PROXY_SESSIONS=4 ARIAX_PROXY_COUNTRY=ph
+#   custom 另需 ARIAX_PROXY_GATEWAY 与含 {session} 的 ARIAX_PROXY_USER_TEMPLATE

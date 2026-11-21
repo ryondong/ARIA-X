@@ -5,7 +5,7 @@ instead of believed. No dependencies, no Docker, throwaway credentials.
 
 ```bash
 ./run-auth.sh lab        # http://127.0.0.1:8899
-./run-auth.sh verify     # 7 capability checks, no model, no API key
+./run-auth.sh verify     # 25 capability checks, no model, no API key
 ```
 
 ## Faults and the one probe that proves each
@@ -31,6 +31,9 @@ instead of believed. No dependencies, no Docker, throwaway credentials.
 | L17 | local solver stand-in | `POST /solver {sitekey}` → `tok-<sitekey>` | `ARIAX_SOLVER_URL` |
 | L18 | RS256 verifier trusts the token's own alg | HS256 signed with `keys/rsa.pub` is accepted | `jwt_sign` |
 | L19 | JS challenge that mints a clearance cookie | `GET /js/42` walls for urllib, clears for a browser | `browser_session` |
+| L20 | echo endpoint reporting what the server received | request headers come back, including `X-Egress` | `http_request` (through `lab/proxy.py`) |
+| L21 | slow 429 to practise the pacing ladder | `GET /slow429` returns 429 + `Retry-After` | any tool, observe the delay |
+| L22 | page with a button, for pointer work | `GET /click` sets `#out` to `clicked-ok` only when really clicked | `browser_session action=click` |
 
 `db.sqlite3` additionally has a deleted row (`invoices.id = 3`, "Secret Co") that
 is still in the file — use `sqlite3 db.sqlite3 ".recover"` after downloading it
@@ -53,3 +56,6 @@ Run it after every change to `src/aria_x/tools/auth.py`, and again after any
 - Delete `lab/fixtures/` to regenerate the served artifacts.
 - `run-auth.sh` points `ARIAX_SOLVER_URL` at `/solver` for you; a real key
   (`ARIAX_CAPTCHA_KEY`) takes precedence over the local stand-in.
+- Egress checks start `lab/proxy.py` on **8901/8902** (forward proxy, absolute-URI
+  for http and CONNECT for https, stamps `X-Egress: <id>`). Free those ports before
+  rerunning A21/A23/A24; the verifier kills what it started, not what it found.
