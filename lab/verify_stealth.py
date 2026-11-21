@@ -142,8 +142,8 @@ def main(argv: list[str]) -> int:
         verdict.append("and they agree on the Akamai h2 fingerprint too")
     for line in verdict:
         print(" - " + line)
-    print("\nResidual, even at the top rung: constant egress IP/ASN, no mouse or scroll, "
-          "DNS done locally, and the server's own access log.")
+    print("\nResidual, even at the top rung: the server's own access log; egress IP (fixed unless ARIAX_PROXIES is set, one ASN shared by a datacentre pool); "
+          "local DNS on direct rungs; no dwell on a real element.")
     return 0 if chrome_ja3 not in {"-", python_ja3} else 1
 
 
