@@ -27,6 +27,8 @@ instead of believed. No dependencies, no Docker, throwaway credentials.
 | L13 | soft-404 (200 + "Not Found") on everything unknown | `/nope` → 200 with the same 79-byte body | `artifact_probe` |
 | L14 | internal notes JSON with no auth | `GET /api/v1/internal/notes` | `http_request` |
 | L15 | session cookie issued before authentication | `GET /login` sets `sid` | `http_session` |
+| L16 | captcha wall in front of a 2-digit code | `GET /secure/00` returns a reCAPTCHA-shaped 200 | `code_probe` (blocked), token lane (solved) |
+| L17 | local solver stand-in | `POST /solver {sitekey}` → `tok-<sitekey>` | `ARIAX_SOLVER_URL` |
 
 `db.sqlite3` additionally has a deleted row (`invoices.id = 3`, "Secret Co") that
 is still in the file — use `sqlite3 db.sqlite3 ".recover"` after downloading it
@@ -47,3 +49,5 @@ Run it after every change to `src/aria_x/tools/auth.py`, and again after any
 - The lab rate-limits `/otp/*` and `/reset/verify` at 6 attempts per IP — that is
   a feature, not a bug: it is what the `xff_rotate` path exists for.
 - Delete `lab/fixtures/` to regenerate the served artifacts.
+- `run-auth.sh` points `ARIAX_SOLVER_URL` at `/solver` for you; a real key
+  (`ARIAX_CAPTCHA_KEY`) takes precedence over the local stand-in.

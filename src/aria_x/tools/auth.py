@@ -41,9 +41,13 @@ from typing import Any, Iterable
 
 from ..util import json_dumps, json_loads, now_iso, redact, truncate
 from .base import ToolContext, ToolRegistry, ToolResult, ToolSpec
+from . import challenge as chal
 from .net import (_ALLOWED_METHODS, DEFAULT_HTTP_TIMEOUT, MAX_HTTP_BYTES, _clean_headers,
                   _decode_body, _response_headers, _save_evidence, _ScopedRedirectHandler)
 from .terminal import audit, clamp_float, clamp_int
+
+#: Backends on which a real ``curl`` binary is reachable; others fall back to urllib.
+_CURL_BACKENDS = {"local"}
 
 MAX_MATRIX_VARIANTS = 48
 MAX_ATTEMPTS = 400
@@ -217,8 +221,20 @@ def _session_headers(ctx: ToolContext, name: str) -> tuple[http.cookiejar.Mozill
 def _send(ctx: ToolContext, *, url: str, method: str = "GET", headers: dict[str, str] | None = None,
           body: str | None = None, session: str = "", follow: bool = False,
           timeout: float = DEFAULT_HTTP_TIMEOUT, max_bytes: int = 65536,
-          jar: http.cookiejar.MozillaCookieJar | None = None) -> dict[str, Any]:
-    """One scoped, rate-limited, bounded request. Never raises for 4xx/5xx."""
+          jar: http.cookiejar.MozillaCookieJar | None = None, client: str = "",
+          curl_extra: str = "") -> dict[str, Any]:
+    """One scoped, rate-limited, bounded request. Never raises for 4xx/5xx.
+
+    ``client='curl'`` shells out to curl when the sandbox is local: that buys
+    HTTP/2, ALPN and a browser-ish TLS stack, which urllib cannot do. The scope
+    check, rate limit, evidence and challenge detection are identical either way.
+    """
+    if client == "curl" and getattr(ctx.sandbox, "backend", "") in _CURL_BACKENDS:
+        result = _send_curl(ctx, url=url, method=method.upper(), headers=headers, body=body,
+                            follow=follow, timeout=timeout, max_bytes=max_bytes, jar=jar,
+                            extra=curl_extra)
+        if not result.get("curl_unavailable"):
+            return result
     method = method.upper()
     decision = ctx.scope.require_url(url, method)
     host = decision.host or (urllib.parse.urlsplit(url).hostname or "")
@@ -291,12 +307,121 @@ def _send(ctx: ToolContext, *, url: str, method: str = "GET", headers: dict[str,
         "body": body_text,
         "headers": response_headers,
     })
+    flagged = chal.detect(status, response_headers, body_text)
+    if flagged:
+        row["challenge"] = flagged
+        audit(ctx, "http_request", "challenge", url, {"vendor": flagged["vendor"],
+                                                      "kind": flagged["kind"]})
+    return row
+
+
+#: curl write-out fields, space separated, captured on one stdout line.
+_CURL_FORMAT = "%{http_code} %{size_download} %{time_total} %{content_type}"
+
+
+def _send_curl(ctx: ToolContext, *, url: str, method: str, headers: dict[str, str] | None,
+               body: str | None, follow: bool, timeout: float, max_bytes: int,
+               jar: http.cookiejar.MozillaCookieJar | None, extra: str) -> dict[str, Any]:
+    """Same contract as the urllib path, executed through the local curl binary."""
+    import shlex
+
+    method = method.upper()
+    decision = ctx.scope.require_url(url, method)
+    host = decision.host or (urllib.parse.urlsplit(url).hostname or "")
+    ctx.scope.acquire_slot(host)
+    audit(ctx, "http_request", "allowed", url,
+          {"method": method, "host": host, "port": decision.port, "via": "curl"})
+
+    state = _state_dir(ctx)
+    stamp = f"{int(time.time() * 1000)}"
+    header_path = state / f"curl_{stamp}.hdr"
+    body_path = state / f"curl_{stamp}.body"
+    request_headers = {"User-Agent": "ARIA-X/0.1 (authorized security research)", "Accept": "*/*"}
+    request_headers.update(_headers(headers, keep_host=True))
+
+    argv = ["curl", "-sS", "--http2", "--compressed", "--max-time", f"{int(max(timeout, 1))}",
+            "--max-filesize", str(max_bytes), "-X", method, "-D", str(header_path),
+            "-o", str(body_path), "--write-out", _CURL_FORMAT]
+    if follow:
+        argv += ["--location", "--max-redirs", "5"]
+    if jar is not None:
+        argv += ["-b", str(_jar_path(ctx, "_curl")), "-c", str(_jar_path(ctx, "_curl"))]
+    data: bytes | None = None
+    if body is not None and method not in {"GET", "HEAD"}:
+        data = str(body).encode("utf-8")
+        request_headers.setdefault("Content-Type", "application/x-www-form-urlencoded")
+    for name, value in request_headers.items():
+        if value:
+            argv += ["-H", f"{name}: {value}"]
+    if data is not None:
+        # --data-binary @file keeps the exact bytes and avoids shell re-quoting
+        payload_path = state / f"curl_{stamp}.data"
+        payload_path.write_bytes(data)
+        argv += ["--data-binary", f"@{payload_path.as_posix()}"]
+    if extra:
+        argv += shlex.split(extra)
+    argv.append(url)
+
+    started = time.monotonic()
+    run = ctx.sandbox.run(" ".join(shlex.quote(part) for part in argv), timeout=timeout + 15)
+    elapsed = int((time.monotonic() - started) * 1000)
+    row: dict[str, Any] = {"url": url, "method": method, "status": 0, "ms": elapsed}
+    if run.exit_code == 127 or (run.exit_code == 126 and "curl" in (run.stderr or "")):
+        row["curl_unavailable"] = True
+        return row
+    stdout = (run.stdout or "").strip().splitlines()
+    fields = (stdout[-1] if stdout else "").split(" ", 3)
+    try:
+        row["status"] = int(fields[0] or 0)
+    except (ValueError, IndexError):
+        row["status"] = 0
+    if run.timed_out:
+        row["error"] = "curl timeout"
+        return row
+    if row["status"] == 0 and run.stderr:
+        row["error"] = truncate(run.stderr.strip(), 300)
+        return row
+
+    response_headers: dict[str, str] = {}
+    try:
+        for line in header_path.read_text("utf-8", "replace").splitlines():
+            if ":" in line and not line.startswith("HTTP/"):
+                name, _, value = line.partition(":")
+                response_headers[name.strip()] = truncate(value.strip(), 1000)
+    except OSError:
+        pass
+    try:
+        raw = body_path.read_bytes()[:max_bytes]
+    except OSError:
+        raw = b""
+    for path in (header_path, body_path):
+        path.unlink(missing_ok=True)
+    if jar is not None:
+        saved = _load_jar(ctx, "_curl")
+        for cookie in saved:
+            jar.set_cookie(cookie)
+
+    body_text = _decode_body(raw, response_headers.get("Content-Type", ""))
+    lower = {k.lower(): v for k, v in response_headers.items()}
+    row.update({
+        "status": row["status"], "length": len(raw),
+        "content_type": lower.get("content-type", ""),
+        "location": lower.get("location", ""),
+        "www_authenticate": lower.get("www-authenticate", ""),
+        "set_cookie": bool(lower.get("set-cookie")), "body_sha": _sha(body_text),
+        "body": body_text, "headers": response_headers, "transport": "curl",
+    })
+    flagged = chal.detect(row["status"], response_headers, body_text)
+    if flagged:
+        row["challenge"] = flagged
     return row
 
 
 def _row_summary(row: dict[str, Any], body_chars: int = 400) -> dict[str, Any]:
     out = {k: row.get(k) for k in ("method", "url", "status", "length", "ms", "content_type",
                                    "location", "set_cookie", "body_sha", "error")}
+    if row.get("challenge"):
+        out["challenge"] = chal.describe(row["challenge"])
     body = row.get("body") or ""
     if body:
         out["excerpt"] = truncate(re.sub(r"\s+", " ", body), body_chars)
@@ -361,9 +486,18 @@ def http_session(ctx: ToolContext, kwargs: dict[str, Any]) -> ToolResult:
     sessions = _sessions(ctx)
 
     if action == "list":
-        rows = [{"name": k, "cookies": len(_load_jar(ctx, k)),
-                 "headers": sorted((v.get("headers") or {}).keys()),
-                 "note": v.get("note", "")} for k, v in sessions.items()]
+        reveal = bool(kwargs.get("reveal"))
+        rows: list[dict[str, Any]] = []
+        for key, record in sessions.items():
+            jar_items = list(_load_jar(ctx, key))
+            row = {"name": key, "cookies": len(jar_items),
+                   "cookie_names": sorted({c.name for c in jar_items}),
+                   "headers": sorted((record.get("headers") or {}).keys()),
+                   "note": record.get("note", "")}
+            if reveal:
+                # the exact Cookie header, so it can be handed to another session or a vault
+                row["cookie_header"] = "; ".join(f"{c.name}={c.value}" for c in jar_items)
+            rows.append(row)
         return ToolResult.success({"sessions": rows}, text=json_dumps(rows, indent=2))
 
     if action == "close":
@@ -372,18 +506,49 @@ def http_session(ctx: ToolContext, kwargs: dict[str, Any]) -> ToolResult:
         _write_sessions(ctx, sessions)
         return ToolResult.success({"name": name, "closed": True}, text=f"closed session '{name}'")
 
-    if action not in {"open", "send"}:
+    if action not in {"open", "send", "import"}:
         return ToolResult.failure(f"unknown action '{action}'",
-                                  data={"actions": ["open", "send", "list", "close"]})
+                                  data={"actions": ["open", "send", "import", "list", "close"]})
 
     url = str(kwargs.get("url") or "").strip()
     if not url:
-        return ToolResult.failure("url is required for open/send")
+        return ToolResult.failure("url is required for open/send/import")
     jar, stored_headers = _session_headers(ctx, name)
-    if action == "open":
+    if action in {"open", "import"}:
         jar = http.cookiejar.MozillaCookieJar(str(_jar_path(ctx, name)))
         stored_headers = {}
         sessions.setdefault(name, {})
+        if action == "import":
+            sessions[name]["headers"] = (sessions[name].get("headers") or {})
+            import_headers = _headers(kwargs.get("headers"))
+            sessions[name]["headers"].update(import_headers)
+            stored_headers.update(import_headers)
+            raw_cookies = str(kwargs.get("cookies") or "")
+            cookie_file = str(kwargs.get("cookie_file") or "")
+            if cookie_file:
+                path = Path(cookie_file) if Path(cookie_file).is_absolute() else Path(ctx.workdir) / cookie_file
+                try:
+                    raw_cookies += "; " + path.read_text("utf-8", "replace")
+                except OSError as exc:
+                    return ToolResult.failure(f"cookie_file unreadable: {exc}")
+            parts = urllib.parse.urlsplit(url)
+            injected = 0
+            for piece in re.split(r"[;\n]", raw_cookies):
+                cookie_name, _, cookie_value = piece.strip().partition("=")
+                cookie_name = cookie_name.strip()
+                if not cookie_name or not cookie_value.strip():
+                    continue
+                jar.set_cookie(http.cookiejar.Cookie(
+                    0, cookie_name, cookie_value.strip(), None, False, parts.hostname or "",
+                    False, False, "/", True, False, None, False, None, None, {}))
+                injected += 1
+            _save_jar(ctx, jar)
+            _write_sessions(ctx, sessions)
+            if not injected and not import_headers:
+                return ToolResult.failure("import needs cookies, cookie_file or headers")
+            return ToolResult.success(
+                {"session": name, "cookies": len(jar), "headers": sorted(stored_headers)},
+                text=f"imported {injected} cookies and {len(stored_headers)} headers into '{name}'")
     elif jar is None:
         return ToolResult.failure(f"session '{name}' does not exist; call action=open first")
 
@@ -394,7 +559,32 @@ def http_session(ctx: ToolContext, kwargs: dict[str, Any]) -> ToolResult:
                 body=body if body is None else str(body), session=name,
                 follow=bool(kwargs.get("follow")), timeout=clamp_float(kwargs.get("timeout"), 1.0, 90.0,
                                                                       DEFAULT_HTTP_TIMEOUT),
-                max_bytes=clamp_int(kwargs.get("max_bytes"), 256, MAX_HTTP_BYTES, 131072), jar=jar)
+                max_bytes=clamp_int(kwargs.get("max_bytes"), 256, MAX_HTTP_BYTES, 131072), jar=jar,
+                client=str(kwargs.get("client") or ""), curl_extra=str(kwargs.get("curl_extra") or ""))
+    # A wall is not a result: solve or inject, then retry exactly once.
+    retry: dict[str, Any] = {}
+    if row.get("challenge"):
+        solution = chal.resolve_token(ctx, kwargs, row["challenge"], url)
+        retry = {"challenge": chal.describe(row["challenge"]), **solution}
+        cookie_name = str(kwargs.get("token_cookie") or "")
+        if solution.get("token") and cookie_name:
+            parts = urllib.parse.urlsplit(url)
+            jar.set_cookie(http.cookiejar.Cookie(
+                0, cookie_name, solution["token"], None, False, parts.hostname or "",
+                False, False, "/", True, False, None, False, None, None, {}))
+            solution["token"] = ""  # carried by the jar, not the body
+            retry["token"] = "(cookie)"
+        if solution.get("token"):
+            headers2, body2, url2, how = chal.inject(dict(headers), body, solution["token"],
+                                                     row["challenge"], kwargs, url)
+            retry["injected"] = how
+            row = _send(ctx, method=str(kwargs.get("method") or "GET"), url=url2, headers=headers2,
+                        body=body2, session=name, follow=bool(kwargs.get("follow")),
+                        timeout=clamp_float(kwargs.get("timeout"), 1.0, 90.0, DEFAULT_HTTP_TIMEOUT),
+                        max_bytes=clamp_int(kwargs.get("max_bytes"), 256, MAX_HTTP_BYTES, 131072),
+                        jar=jar, client=str(kwargs.get("client") or ""),
+                        curl_extra=str(kwargs.get("curl_extra") or ""))
+            retry["cleared"] = not row.get("challenge")
     _save_jar(ctx, jar)
 
     # Persist any captured tokens as headers on the session so later calls carry them.
@@ -433,15 +623,20 @@ def http_session(ctx: ToolContext, kwargs: dict[str, Any]) -> ToolResult:
                                                 "headers": _headers(headers, keep_host=True),
                                                 "body": truncate(redact(str(body or "")), 2000)},
                                    "response": _row_summary(row, 4000),
-                                   "session": name, "captured": captured}, prefix="auth")
+                                   "session": name, "captured": captured,
+                                   "challenge_retry": retry}, prefix="auth")
     summary = _row_summary(row, 1200)
+    payload_extra = {"challenge": summary.get("challenge"), "challenge_retry": retry or None}
     payload = {"session": name, "cookies": len(jar), "response": summary,
-               "captured_headers": captured}
+               "captured_headers": captured, **payload_extra}
     if evidence:
         payload["evidence_path"] = evidence
     text = (f"HTTP {row.get('status')} {row.get('method')} {url} ({row.get('length', 0)} bytes, "
             f"{row.get('ms', 0)} ms) session={name} cookies={len(jar)}"
             + (f" captured={[c['as_header'] for c in captured]}" if captured else "")
+            + (f" WALL={retry.get('challenge')}" if retry.get("challenge") else "")
+            + (f" retried via {retry.get('source')} cleared={retry.get('cleared')}"
+               if retry.get("source") else "")
             + (f" error={row['error']}" if row.get("error") else "")
             + f"\n\n{summary.get('excerpt', '')}")
     return ToolResult.success(payload, text=truncate(text, 8000))
@@ -577,6 +772,21 @@ def http_matrix(ctx: ToolContext, kwargs: dict[str, Any]) -> ToolResult:
         except (TypeError, ValueError):
             return str(value)
 
+    # A wall makes every variant look identical. Resolve a token once, up front, and
+    # plant it on every row; record the wall either way so the report cannot read
+    # "no difference" where the truth is "blocked".
+    wall: dict[str, Any] = {}
+    token_note: dict[str, Any] = {}
+    injected = ""
+    if kwargs.get("token_from") or kwargs.get("challenge_token"):
+        probe = _send(ctx, method=method, url=url, headers=base_headers, body=body, session=session,
+                      follow=follow, timeout=timeout, max_bytes=4096, jar=jar,
+                      client=str(kwargs.get("client") or ""))
+        if probe.get("challenge"):
+            wall = probe["challenge"]
+            token_note = chal.resolve_token(ctx, kwargs, wall, url)
+            injected = token_note.get("token") or ""
+
     matrix: list[dict[str, Any]] = []
     if not any(str(v.get("label") or "") == "baseline" for v in variants):
         base_row = {"label": "baseline", "method": method, "path": None}
@@ -591,9 +801,13 @@ def http_matrix(ctx: ToolContext, kwargs: dict[str, Any]) -> ToolResult:
             continue
         headers = dict(base_headers)
         headers.update(_headers(row.get("headers"), keep_host=True))
-        attempt = _send(ctx, method=str(row.get("method") or method).upper(), url=target_url(row),
-                        headers=headers, body=render(row.get("body") if row.get("body") is not None
-                                                     else body),
+        row_body = render(row.get("body") if row.get("body") is not None else body)
+        row_url = target_url(row)
+        if injected:
+            headers, row_body, row_url, _ = chal.inject(headers, row_body, injected, wall, kwargs,
+                                                        row_url)
+        attempt = _send(ctx, method=str(row.get("method") or method).upper(), url=row_url,
+                        headers=headers, body=row_body,
                         session=session, follow=follow, timeout=timeout,
                         max_bytes=clamp_int(kwargs.get("max_bytes"), 256, MAX_HTTP_BYTES, 32768),
                         jar=jar)
@@ -632,6 +846,7 @@ def http_matrix(ctx: ToolContext, kwargs: dict[str, Any]) -> ToolResult:
         if markers:
             row["auth_markers"] = markers[:6]
 
+    challenged = [r for r in measured if r.get("challenge")]
     flagged = [r for r in measured if r.get("verdict") == "DIFF"]
     evidence = _save_evidence(ctx, {
         "request": {"url": url, "method": method, "headers": base_headers, "body": body,
@@ -642,13 +857,18 @@ def http_matrix(ctx: ToolContext, kwargs: dict[str, Any]) -> ToolResult:
     }, prefix="matrix")
 
     lines = [f"{len(measured)} variants, baseline={baseline.get('label')} "
-             f"({baseline.get('status')}, {baseline_len} bytes), {len(flagged)} differ"]
+             f"({baseline.get('status')}, {baseline_len} bytes), {len(flagged)} differ"
+             + (f", WALL {chal.describe(wall)} token={token_note.get('source')}"
+                f" cleared={not challenged}" if wall else "")
+             + (f", {len(challenged)} rows still walled" if challenged and not wall else "")]
     for row in measured:
         tag = row.get("verdict")
         detail = (";".join(row.get("signals") or []) or row.get("error") or "")
         lines.append(f"  {tag:<8} {row.get('label'):<24} {row.get('method')} {row.get('status'):>3} "
                      f"{row.get('length', 0):>7}B {detail}")
     payload: dict[str, Any] = {"baseline": _row_summary(baseline), "differing": len(flagged),
+                               "wall": chal.describe(wall) if wall else "",
+                               "wall_rows": len(challenged), "token": token_note or None,
                                "matrix": [_row_summary(r) | {"label": r.get("label"),
                                                              "verdict": r.get("verdict"),
                                                              "signals": r.get("signals"),
@@ -1079,20 +1299,52 @@ def code_probe(ctx: ToolContext, kwargs: dict[str, Any]) -> ToolResult:
             target = url
         if "{}" in target:
             target = target.replace("{}", code)
+        if injected_token:
+            local, payload, target, _ = chal.inject(local, payload, injected_token,
+                                                    token_wall or {}, kwargs, target)
         return _send(ctx, method=method, url=target, headers=local, body=payload,
                      timeout=timeout, max_bytes=clamp_int(kwargs.get("max_bytes"), 256, 200_000,
-                                                          16384), jar=jar)
+                                                          16384), jar=jar,
+                     client=str(kwargs.get("client") or ""))
+
+    injected_token = ""
+    token_wall: dict[str, Any] = {}
+    challenge_log: dict[str, Any] = {}
 
     space = len(charset) ** length
     max_attempts = min(max_attempts, max(1, space - start))
     baseline = request("_invalid_", 0)
     if baseline.get("error") and not baseline.get("status"):
         return ToolResult.failure(f"baseline request failed: {baseline['error']}")
+    # A wall swallows every attempt identically. Deal with it before spending budget.
+    if baseline.get("challenge"):
+        token_wall = baseline["challenge"]
+        solution = chal.resolve_token(ctx, kwargs, token_wall, url)
+        challenge_log = {"wall": chal.describe(token_wall), **solution}
+        if solution.get("token"):
+            injected_token = solution["token"]
+            baseline = request("_invalid_", 0)
+            challenge_log["cleared"] = not baseline.get("challenge")
+        if baseline.get("challenge"):
+            blocked = {"blocked": True, "found": [], "candidates": [],
+                       "wall": chal.describe(baseline["challenge"]),
+                       "reaction": baseline["challenge"].get("reaction"),
+                       "token": challenge_log, "attempts": 1,
+                       "baseline": _row_summary(baseline)}
+            evidence = _save_evidence(ctx, {"url": url, "blocked": blocked}, prefix="code_probe")
+            if evidence:
+                blocked["evidence_path"] = evidence
+            return ToolResult.success(
+                blocked, text=(f"BLOCKED by {blocked['wall']} before enumeration: "
+                               f"{blocked['reaction']}\ntoken channel: "
+                               f"{challenge_log.get('source') or 'none'} "
+                               f"({challenge_log.get('detail')})"))
     base_status = baseline.get("status") or 0
     base_len = baseline.get("length") or 0
     base_sha = baseline.get("body_sha")
 
     attempts = 0
+    consecutive = 0
     candidates: list[dict[str, Any]] = []
     found: list[dict[str, Any]] = []
     started = time.monotonic()
@@ -1102,6 +1354,13 @@ def code_probe(ctx: ToolContext, kwargs: dict[str, Any]) -> ToolResult:
         code = code_at(index)
         row = request(code, index + 1)
         attempts += 1
+        if row.get("challenge"):
+            challenge_log.setdefault("rows", []).append(code)
+            consecutive += 1
+            if consecutive >= 2 and not injected_token:
+                break  # every remaining attempt would come back as the wall
+        else:
+            consecutive = 0
         status = row.get("status") or 0
         signals = []
         if status != base_status:
@@ -1133,6 +1392,7 @@ def code_probe(ctx: ToolContext, kwargs: dict[str, Any]) -> ToolResult:
                                     "baseline": _row_summary(baseline)}, prefix="code_probe")
     coverage = attempts / space if space else 0
     payload: dict[str, Any] = {
+        "challenge": challenge_log or None, "blocked": bool(challenge_log and not injected_token),
         "space": space, "attempts": attempts, "rate_per_s": round(rate, 2),
         "coverage": round(coverage, 4),
         "eta_seconds_full_space": round(space / rate, 1) if rate else None,
@@ -1221,17 +1481,32 @@ def register(registry: ToolRegistry) -> None:
         description=(
             "Named, persistent cookie-jar HTTP session. action=open creates it (optionally logging in "
             "with url/method/body), action=send reuses the jar and any captured auth header. "
+            "action=import seeds the jar from a browser: cookies/cookie_file/headers. "
             "capture=[{from:'json'|'header'|'body', path/regex/name, as_header, prefix}] lifts a token "
-            "from the response into a header for all later calls. Redirects are off unless follow=true."
+            "from the response into a header for all later calls. A detected wall is solved via "
+            "token_from (vault:NAME|ask|solver|browser) and retried once. client=curl uses HTTP/2. "
+            "Redirects are off unless follow=true."
         ),
         parameters={"type": "object", "properties": {
-            "action": {"type": "string", "enum": ["open", "send", "list", "close"]},
+            "action": {"type": "string", "enum": ["open", "send", "import", "list", "close"]},
             "name": {"type": "string"},
+            "cookies": {"type": "string", "description": "action=import: raw 'a=1; b=2' cookie string."},
+            "reveal": {"type": "boolean", "description": "action=list: include the cookie header."},
+            "cookie_file": {"type": "string", "description": "action=import: file of name=value pairs."},
             "url": {"type": "string"},
             "method": {"type": "string"},
             "headers": {"type": "object", "additionalProperties": {"type": "string"}},
             "body": {"type": "string"},
             "capture": {"type": "array", "items": {"type": "object"}},
+            "challenge_token": {"type": "string"},
+            "token_from": {"type": "string", "enum": ["vault:NAME", "ask", "solver", "browser"]},
+            "token_param": {"type": "string"}, "token_header": {"type": "string"},
+            "token_in": {"type": "string", "enum": ["body", "json", "query"]},
+            "token_cookie": {"type": "string"},
+            "solver_service": {"type": "string", "enum": ["local", "2captcha", "capsolver"]},
+            "solver_key": {"type": "string"}, "solver_timeout": {"type": "number"},
+            "client": {"type": "string", "enum": ["", "curl"]},
+            "curl_extra": {"type": "string"},
             "follow": {"type": "boolean"},
             "note": {"type": "string"},
             "timeout": {"type": "number"},
@@ -1258,6 +1533,12 @@ def register(registry: ToolRegistry) -> None:
             "body": {"type": "string"},
             "session": {"type": "string"},
             "token": {"type": "string"},
+            "challenge_token": {"type": "string"},
+            "token_from": {"type": "string", "enum": ["vault:NAME", "ask", "solver"]},
+            "token_param": {"type": "string"}, "token_header": {"type": "string"},
+            "token_in": {"type": "string", "enum": ["body", "json", "query"]},
+            "solver_service": {"type": "string"}, "solver_timeout": {"type": "number"},
+            "client": {"type": "string", "enum": ["", "curl"]},
             "follow": {"type": "boolean"},
             "timeout": {"type": "number"},
             "max_seconds": {"type": "number"},
@@ -1325,6 +1606,12 @@ def register(registry: ToolRegistry) -> None:
             "method": {"type": "string"}, "field": {"type": "string"}, "body": {"type": "string"},
             "headers": {"type": "object", "additionalProperties": {"type": "string"}},
             "session": {"type": "string"}, "match": {"type": "string"}, "xff_rotate": {"type": "boolean"},
+            "challenge_token": {"type": "string"},
+            "token_from": {"type": "string", "enum": ["vault:NAME", "ask", "solver"]},
+            "token_param": {"type": "string"}, "token_header": {"type": "string"},
+            "token_in": {"type": "string", "enum": ["body", "json", "query"]},
+            "solver_service": {"type": "string"}, "solver_timeout": {"type": "number"},
+            "client": {"type": "string", "enum": ["", "curl"]},
             "counter_field": {"type": "string"}, "counter_start": {"type": "integer"},
             "stop_on_match": {"type": "boolean"}, "max_seconds": {"type": "number"},
             "timeout": {"type": "number"}, "max_bytes": {"type": "integer"}},

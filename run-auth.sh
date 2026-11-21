@@ -13,6 +13,11 @@ set -euo pipefail
 cd "$(dirname "$0")"
 export PYTHONPATH=src
 if [ -n "${DEEPSEEK_API_KEY:-}" ]; then export ARIA_X_API_KEY="$DEEPSEEK_API_KEY"; fi
+# The lab ships a local solver stand-in; point the token lane at it unless a real
+# solver URL (ARIAX_SOLVER_URL) or a keyed service (ARIAX_CAPTCHA_KEY) is supplied.
+if [ -z "${ARIAX_SOLVER_URL:-}" ] && [ -z "${ARIAX_CAPTCHA_KEY:-}" ]; then
+  export ARIAX_SOLVER_URL="http://127.0.0.1:${PORT:-8899}/solver"
+fi
 
 case "${1:-}" in
   lab)

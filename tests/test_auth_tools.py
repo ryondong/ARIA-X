@@ -21,6 +21,7 @@ sys.path.insert(0, str(REPO))
 sys.path.insert(0, str(REPO / "lab"))
 
 import lab_app  # noqa: E402
+from aria_x.tools import challenge as chal  # noqa: E402
 
 from aria_x.config import AriaXConfig, SandboxConfig, ScopeConfig  # noqa: E402
 from aria_x.events import EventBus  # noqa: E402
@@ -116,6 +117,53 @@ class AuthToolTests(unittest.TestCase):
                            url=f"{self.base}/api/me")
         self.assertEqual(me.data["response"]["status"], 200)
         self.assertIn("alice", me.data["response"]["excerpt"])
+
+    # -- challenge detection ---------------------------------------------
+
+    def test_detect_names_the_wall_and_its_kind(self):
+        wall = chal.detect(200, {}, "<title>Just a moment...</title><div class='g-recaptcha' "
+                                    "data-sitekey='sitekey-abc123'></div>")
+        # the wall is Cloudflare's, but the thing you can actually solve is the widget
+        self.assertEqual(wall["wall_vendor"], "cloudflare")
+        self.assertEqual(wall["vendor"], "recaptcha")
+        self.assertEqual(wall["kind"], "captcha")
+        self.assertEqual(wall["sitekey"], "sitekey-abc123")
+
+    def test_detect_ignores_a_clean_page_and_calls_out_a_captcha(self):
+        self.assertIsNone(chal.detect(200, {}, "<h1>hello</h1>"))
+        self.assertEqual(chal.detect(200, {}, "<div class='h-captcha'></div>")["kind"], "captcha")
+        self.assertEqual(chal.detect(429, {}, "slow down")["kind"], "rate-limit")
+
+    def test_captcha_wall_is_reported_blocked_not_absent(self):
+        result = self.run_tool("code_probe", url=f"{self.base}/secure/{{}}", length=2,
+                               max_attempts=20, match=r'"ok": ?true')
+        self.assertTrue(result.ok, result.error)
+        self.assertTrue(result.data["blocked"])
+        self.assertEqual(result.data["found"], [])
+        self.assertIn("BLOCKED", result.text)
+
+    def test_solver_token_clears_the_wall_and_the_code_is_found(self):
+        lab_app.ATTEMPTS.clear()
+        old = __import__("os").environ.get("ARIAX_SOLVER_URL")
+        __import__("os").environ["ARIAX_SOLVER_URL"] = f"{self.base}/solver"
+        try:
+            result = self.run_tool("code_probe", url=f"{self.base}/secure/{{}}", length=2,
+                                   max_attempts=100, match=r'"ok": ?true', token_from="solver",
+                                   token_in="query")
+        finally:
+            if old is None:
+                __import__("os").environ.pop("ARIAX_SOLVER_URL", None)
+            else:
+                __import__("os").environ["ARIAX_SOLVER_URL"] = old
+        self.assertEqual([row["code"] for row in result.data["found"]], ["42"])
+        self.assertFalse(result.data["blocked"])
+
+    def test_vault_token_beats_the_wall_too(self):
+        self.run_tool("vault", action="put", name="cap", value="tok-sitekey-secure")
+        result = self.run_tool("code_probe", url=f"{self.base}/secure/{{}}", length=2,
+                               max_attempts=100, match=r'"ok": ?true',
+                               token_from="vault:cap", token_in="query")
+        self.assertEqual([row["code"] for row in result.data["found"]], ["42"])
 
     # -- differential ----------------------------------------------------
 
@@ -223,6 +271,39 @@ class AuthToolTests(unittest.TestCase):
                                start=1, count=5)
         self.assertTrue(result.ok, result.error)
         self.assertEqual(result.data["probed"], 5)
+
+    def test_import_action_seeds_a_jar_from_a_browser_cookie(self):
+        opened = self.run_tool("http_session", action="open", name="src", url=f"{self.base}/login",
+                               method="POST", body="username=alice&password=alicepw1")
+        self.assertTrue(opened.ok, opened.error)
+        sid = next(c.value for c in self.registry.execute("http_session",
+                                                          {"action": "list"}, self.ctx).data["sessions"]
+                   if False) if False else None
+        jar = self.ctx and None
+        # read the sid straight from the live session jar
+        from aria_x.tools.auth import _load_jar
+        sid = next(c.value for c in _load_jar(self.ctx, "src"))
+        imported = self.run_tool("http_session", action="import", name="browser",
+                                 url=f"{self.base}/account/1", cookies=f"sid={sid}")
+        self.assertTrue(imported.ok, imported.error)
+        read = self.run_tool("http_session", action="send", name="browser",
+                             url=f"{self.base}/account/2")
+        self.assertEqual(read.data["response"]["status"], 200)
+        self.assertIn("bob", read.data["response"]["excerpt"])
+
+    def test_curl_client_reports_its_transport(self):
+        from aria_x.tools.sandbox import build_sandbox
+        import shutil
+        if not shutil.which("curl"):
+            self.skipTest("curl not installed")
+        self.ctx.sandbox = build_sandbox(self.ctx.config.sandbox.__class__(
+            backend="local", timeout=10, max_output=4000), self.workdir)
+        result = self.run_tool("http_matrix", url=f"{self.base}/admin", family="path_tricks",
+                               client="curl")
+        self.assertTrue(result.ok, result.error)
+        self.assertEqual(result.data["baseline"]["status"], 302)
+        rows = {row["label"]: row for row in result.data["matrix"]}
+        self.assertEqual(rows["path_trailing_slash"]["status"], 200)
 
     # -- vault -----------------------------------------------------------
 

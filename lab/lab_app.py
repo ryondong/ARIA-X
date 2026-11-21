@@ -22,6 +22,8 @@ Faults planted (see lab/README.md for the probe that proves each):
   L13 soft-404 (200 + "Not Found") masks real misses     GET  /nope
   L14 internal notes JSON with no auth                   GET  /api/v1/internal/notes
   L15 session cookie set before auth completes           GET  /login
+  L16 captcha wall in front of a 2-digit code            GET  /secure/{code}
+  L17 local solver stand-in (returns tok-<sitekey>)      POST /solver
 """
 
 from __future__ import annotations
@@ -206,6 +208,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.verify_code(query.get("code", ""), json_body=False)
         if path.startswith("/otp/"):
             return self.otp(path.rsplit("/", 1)[1])
+        if path.startswith("/secure/"):
+            return self.secure(path.rsplit("/", 1)[1])
         if path.startswith("/static/"):
             target = FIXTURES / "static" / path.rsplit("/", 1)[1]
             if target.exists():
@@ -244,6 +248,12 @@ class Handler(BaseHTTPRequestHandler):
             return self.verify_code(self.form().get("code", ""), json_body=True)
         if path.startswith("/otp/"):
             return self.otp(path.rsplit("/", 1)[1])
+        if path.startswith("/secure/"):
+            return self.secure(path.rsplit("/", 1)[1])
+        if path == "/solver":
+            body = json.loads(self.raw or "{}")
+            return self.send(200, json.dumps({"token": "tok-" + str(body.get("sitekey") or "")}),
+                             "application/json")
         return self.not_found()
 
     # -- features ---------------------------------------------------------
@@ -263,6 +273,22 @@ class Handler(BaseHTTPRequestHandler):
         if ATTEMPTS[ip] > 6:
             return self.send(429, '{"error":"slow down"}', "application/json",
                              {"Retry-After": "5"})
+        return self.send(200, json.dumps({"ok": code == "42"}), "application/json")
+
+    def secure(self, code: str) -> None:
+        """L16: a hard captcha wall in front of a 2-digit code (reCAPTCHA-shaped)."""
+        source = {k: v[0] for k, v in parse_qs(urlsplit(self.path).query).items()}
+        try:
+            source.update(self.form())
+        except (ValueError, OSError):
+            pass
+        token = (source.get("g-recaptcha-response") or "").strip()
+        if token != "tok-sitekey-secure":
+            return self.send(200, (
+                "<html><head><title>Just a moment...</title>"
+                "<script src='https://www.google.com/recaptcha/api.js'></script></head>"
+                "<body><form><div class='g-recaptcha' data-sitekey='sitekey-secure'></div>"
+                "<input name='g-recaptcha-response'><button>verify</button></form></body></html>"))
         return self.send(200, json.dumps({"ok": code == "42"}), "application/json")
 
     def verify_code(self, code: str, *, json_body: bool) -> None:

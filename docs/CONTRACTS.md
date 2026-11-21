@@ -171,6 +171,15 @@ Register exactly these names via `build_registry(ctx)` in `tools/builtin.py`:
     enumeration with baseline differential, rate/coverage/ETA reporting.
   - `id_walk(url, start/count|ids, marker?)` — object-reference walk ranked by deviation from the median.
   - `vault(action, name?, value?, reveal?)` — run-scoped secret store under `workdir/state/vault.json`.
+- **Bot-management lane (`tools/challenge.py`).** Every `_send` runs `challenge.detect()` on the
+  response and attaches `challenge={vendor, kind, status, marker, sitekey, token_field, clearance_cookie,
+  reaction}`; a 200 carrying a widget is therefore never silently read as content. `http_session`,
+  `http_matrix` and `code_probe` accept `challenge_token` / `token_from` (`vault:NAME`|`ask`|`solver`|
+  `browser`) and `token_param`/`token_header`/`token_in`/`token_cookie` and retry once. `http_session
+  action=import` seeds a jar from `cookies`/`cookie_file`, and `action=list reveal=true` returns the
+  cookie header so one session (or a browser) can seed another. `client=curl` switches the transport to the
+  local curl binary (HTTP/2, ALPN) and falls back to urllib where curl is unreachable.
+  Solver calls go to the vendor, not the target, so they are deliberately *not* scope-checked.
 - `add_fact(title, body, confidence?, intent_id?, asset_values?)` — writes node + edges from intent.
 - `add_finding(title, severity, body, asset_values?, intent_id?, cvss?, evidence?)` — writes finding + evidence.
 - `add_asset(kind, value, parent_value?)` — upsert asset under project.

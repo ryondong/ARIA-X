@@ -178,6 +178,80 @@ def a7(h: Harness) -> str:
     return f"code 42 after {result.data['attempts']} attempts at {result.data['rate_per_s']}/s"
 
 
+@check("A8", "wall detection names the vendor and the kind, and ignores clean pages")
+def a8(h: Harness) -> str:
+    from aria_x.tools import challenge as chal
+    cloudflare = chal.detect(200, {}, "<title>Just a moment...</title>"
+                                      "<div class='g-recaptcha' data-sitekey='key-abcdef12'></div>")
+    ok(cloudflare is not None, "Cloudflare page not detected")
+    ok(cloudflare["kind"] == "captcha", f"widget downgrade failed: {cloudflare['kind']}")
+    ok(cloudflare["sitekey"] == "key-abcdef12", "sitekey not extracted")
+    ok(chal.detect(200, {}, "<h1>hello</h1>") is None, "clean page flagged")
+    ok(chal.detect(429, {}, "slow")["kind"] == "rate-limit", "429 not classified")
+    return "cloudflare+captcha classified, sitekey recovered, clean page ignored"
+
+
+@check("A9", "a wall is reported BLOCKED, not as an absent route")
+def a9(h: Harness) -> str:
+    result = h.tool("code_probe", url=f"{h.base}/secure/{{}}", length=2, max_attempts=20,
+                    match=r'"ok": ?true')
+    ok(result.data["blocked"], "wall not reported as blocked")
+    ok(result.data["found"] == [], "wall produced false positives")
+    ok("BLOCKED" in result.text, "text does not say BLOCKED")
+    ok(result.data["wall"].startswith("recaptcha"), f"wall misidentified: {result.data['wall']}")
+    return "reported blocked with vendor, no false candidate"
+
+
+@check("A10", "solver token clears the wall and the code is recovered")
+def a10(h: Harness) -> str:
+    import os
+    previous = os.environ.get("ARIAX_SOLVER_URL")
+    os.environ["ARIAX_SOLVER_URL"] = f"{h.base}/solver"
+    try:
+        result = h.tool("code_probe", url=f"{h.base}/secure/{{}}", length=2, max_attempts=100,
+                        match=r'"ok": ?true', token_from="solver", token_in="query")
+    finally:
+        if previous is None:
+            os.environ.pop("ARIAX_SOLVER_URL", None)
+        else:
+            os.environ["ARIAX_SOLVER_URL"] = previous
+    ok([row["code"] for row in result.data["found"]] == ["42"],
+       f"code not found through the wall: {result.data['found']}")
+    ok(not result.data["blocked"], "still blocked after solving")
+    return f"wall cleared via solver, code found in {result.data['attempts']} attempts"
+
+
+@check("A11", "browser-seeded session imports a cookie and skips the login form")
+def a11(h: Harness) -> str:
+    from aria_x.tools.auth import _load_jar
+    h.tool("http_session", action="open", name="seed", url=f"{h.base}/login", method="POST",
+           body="username=alice&password=alicepw1")
+    sid = next(cookie.value for cookie in _load_jar(h.ctx, "seed"))
+    h.tool("http_session", action="import", name="browser", url=f"{h.base}/account/1",
+           cookies=f"sid={sid}")
+    read = h.tool("http_session", action="send", name="browser", url=f"{h.base}/account/2")
+    ok(read.data["response"]["status"] == 200, "imported cookie was not accepted")
+    ok("bob" in read.data["response"]["excerpt"], "imported session read the wrong object")
+    return "imported sid accepted without touching the form"
+
+
+@check("A12", "curl transport: HTTP/2-capable client keeps scope and evidence")
+def a12(h: Harness) -> str:
+    import shutil
+    from aria_x.config import SandboxConfig
+    from aria_x.tools.sandbox import build_sandbox
+    if not shutil.which("curl"):
+        raise AssertionError("curl not installed")
+    h.ctx.sandbox = build_sandbox(SandboxConfig(backend="local", timeout=15, max_output=8000),
+                                  h.workdir)
+    result = h.tool("http_matrix", url=f"{h.base}/admin", family="path_tricks", client="curl")
+    rows = {row["label"]: row for row in result.data["matrix"]}
+    ok(rows["baseline"]["status"] == 302, f"curl baseline wrong: {rows['baseline']['status']}")
+    ok(rows["path_trailing_slash"]["status"] == 200, "curl bypass miss")
+    h.ctx.sandbox = MockSandbox(h.ctx.config.sandbox, h.workdir)
+    return "curl carried the differential and still honoured scope"
+
+
 def main(argv: list[str]) -> int:
     wanted = {a.upper() for a in argv if not a.startswith("-")}
     harness = Harness()

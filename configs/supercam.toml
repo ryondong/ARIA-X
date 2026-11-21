@@ -1,68 +1,72 @@
-# ARIA-X engagement config — SuperCam Plus (com.tvt.supercamplus) endpoint surface.
-# Envelope: passive/read-only probes only (DNS, TLS handshake, HEAD/GET, bounded TCP).
-# No auth attempts, no fuzzing, no payloads. One request per endpoint, stop on non-200.
-# Targets are the hostnames discovered statically in the APK (2026-11-20).
+# ARIA-X target config — DRAFT for SuperCam Plus (com.tvt.supercamplus 1.18.2) endpoint set.
+# Prepared by @thoth, endpoints supplied by the reverse-engineer profile.
+# Authority: director's own phone and its own traffic. Non-invasive reads only.
+#
+# SCOPE RULES (hard):
+#   - exact host, host:port, or URL-prefix only
+#   - NO wildcards over third-party domains (no "*.tvt…")
+#   - no CIDR sweeps
+#   - deny lists anything outside the discovered endpoint set
+#   - local bash is convenience, never the boundary
+#
+# targets stays EMPTY until the endpoint list lands. With authorized=true and no
+# targets the start gate fails on purpose — that is the proof the gate is live.
 
-name = "SuperCam Plus endpoint surface"
+name = "SuperCam Plus (A55) endpoint reads"
 data_dir = "data"
 runs_dir = "runs"
 log_level = "INFO"
 
 [scope]
-authorized = true
-targets = [
-  "starvisioncloud.com",
-  "m.autonat.com",
-  "c2.autonat.com",
-  "eu.autonat.com",
-  "app-log.autonat.com",
-  "app-log20-cn-ipv6.starvisioncloud.com",
-  "partner-gz-app-log20.starvisioncloud.com",
-  "en.tvt.net.cn",
-]
-# Nothing outside the discovered endpoint set. Deny other TVT/cloud infrastructure.
+authorized = true              # asserted by the Operator for his own device and traffic
+targets = []                   # FILLED FROM THE APK; exact host[:port] / https://host/prefix only
+
+# Deny beats allow. Populate with every name the APK exposes that we are NOT
+# probing (store/CDN/analytics/adjacent TVT cloud names), because an exact-host
+# target also admits any *other* name resolving to the same IP.
 deny = []
-# allow_private is on ONLY so a DNS answer naming a private address can be *observed*
-# and recorded as a finding. The goal text forbids connecting to it.
-allow_private = true
+#                                   e.g. "play.googleapis.com", "*.tvt.net.cn", "tvt-*.com"
+
+allow_private = true           # LAN handset/device endpoint
 allow_loopback = true
-max_rps = 2.0
-ports = [80, 443, 8130, 40002]
+max_rps = 1.0                  # third-party infra: one request per second per host
+ports = [443, 80]              # bounded connect only; add the device's port if discovered
+max_ports = 12
 
 [llm]
 provider = "openai"
 base_url = "https://api.deepseek.com/v1"
 model = "deepseek-chat"
-api_key = ""
+api_key = ""                   # comes from ARIA_X_API_KEY (bridged from DEEPSEEK_API_KEY)
 temperature = 0.2
 max_tokens = 4096
 max_retries = 2
 tool_mode = "auto"
-json_mode = false
+json_mode = false              # DeepSeek: json_object forces JSON on the reporter's Markdown
 
 [budget]
-max_seconds = 420
-max_llm_calls = 14
-max_tokens = 220000
-max_tool_calls = 20
+# One probe, one finding, then stop. Caps are the safety property, not a scheduler.
+max_seconds = 300
+max_llm_calls = 24
+max_tokens = 200000
+max_tool_calls = 40
 max_steps_per_task = 10
 max_intents_per_reason = 1
 max_concurrency = 1
-max_total_intents = 5
+max_total_intents = 6
 
 [sandbox]
-backend = "local"
-image = "kalilinux/kali-rolling"
+backend = "local"              # Docker not required for read-only HTTP/DNS/TLS
 network = "none"
 timeout = 45
-max_output = 8000
+max_output = 20000
 
 [safety]
-approval = "auto"
+approval = "auto"              # unattended; port_scan/tls_probe are read-only anyway
 block_destructive = true
 redact_secrets = true
-allow_public_targets = true
-max_command_seconds = 30
+allow_public_targets = true    # declared but NOT enforced in v0.1.1 — see gap note
+max_command_seconds = 45
 
 [server]
 host = "127.0.0.1"
@@ -70,6 +74,6 @@ port = 8788
 
 [engine]
 language = "en"
-bootstrap = true
+bootstrap = true               # single direct attempt first — this is the cheap path
 max_idle_rounds = 2
 require_finding_for_completion = true
