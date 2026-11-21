@@ -7,6 +7,7 @@
 #   ./run-auth.sh goals                   # list goal templates
 #   ./run-auth.sh goal auth-presence      # one bounded auth run against the lab
 #   ./run-auth.sh suite                   # verify, then every goal, then summarise
+#   ./run-auth.sh run --goal "..."        # a run whose browser is swept afterwards
 #
 # Needs DEEPSEEK_API_KEY only for the goal/suite runs; verify is offline.
 # The key is bridged to ARIA_X_API_KEY here and never written to disk.
@@ -59,6 +60,10 @@ case "${1:-}" in
       python -m aria_x -c configs/auth-lane.toml run --name "auth:$name" \
         --goal "$(sed '/^$/d' "$f")" --quiet "$@" || echo "  (run failed)"
     done ;;
+  run)
+    shift
+    python -m aria_x -c configs/auth-lane.toml run "$@"
+    close_browsers ;;
   *)
     exec python -m aria_x -c configs/auth-lane.toml "$@" ;;
 esac
