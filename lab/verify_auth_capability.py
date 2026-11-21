@@ -16,7 +16,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import subprocess
 import sys
+import time
 import tempfile
 import threading
 from http.server import ThreadingHTTPServer
@@ -86,11 +88,19 @@ class Harness:
         return result
 
     def close(self) -> None:
+        try:
+            from aria_x.tools import browser
+            browser.shutdown(self.workdir)      # never leave a browser holding the profile
+        except Exception:  # noqa: BLE001 - teardown must not mask the real failure
+            pass
+        try:
+            self.tmp.cleanup()
+        except OSError:
+            pass
         self.store.close()
         self.server.shutdown()
         self.server.server_close()
         self.thread.join(timeout=5)
-        self.tmp.cleanup()
 
 
 # ---------------------------------------------------------------------------
@@ -381,6 +391,86 @@ def a20(h: Harness) -> str:
             f"{chrome_tls['ja3_hash'][:12]}... ({chrome_tls.get('ja4', '')[:12]}...)")
 
 
+#: egress checks need a proxy pair; started lazily by the harness
+_PROXIES: list[subprocess.Popen] = []
+
+
+def _start_proxies(ports: tuple[int, int]) -> None:
+    for port, ident in zip(ports, ("p1", "p2")):
+        _PROXIES.append(subprocess.Popen(
+            [sys.executable, str(REPO / "lab" / "proxy.py"), "--port", str(port), "--id", ident],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL))
+    time.sleep(1.2)
+
+
+@check("A21", "egress: the request leaves through the configured proxy")
+def a21(h: Harness) -> str:
+    import os
+    ports = (8901, 8902)
+    if not _PROXIES:
+        _start_proxies(ports)
+    previous = os.environ.get("ARIAX_PROXIES")
+    os.environ["ARIAX_PROXIES"] = f"http://127.0.0.1:{ports[0]},http://127.0.0.1:{ports[1]}"
+    os.environ["ARIAX_EGRESS"] = "sticky"
+    try:
+        row = h.tool("http_request", url=f"{h.base}/echo")
+        seen = dict(json.loads(row.data["body_excerpt"]).get("headers", []))
+        egress = {k.lower(): v for k, v in seen.items()}.get("x-egress", "")
+        ok(egress in {"p1", "p2"}, f"no proxy mark on the request (saw {egress or 'none'})")
+        status = h.tool("egress", action="status").data
+        ok(status["configured"] == 2, "pool not read from the environment")
+        ok(any(p["uses"] > 0 for p in status["proxies"]), "no use recorded for any egress")
+        rotated = h.tool("egress", action="rotate", host="127.0.0.1").data["egress"]
+        ok(rotated and rotated != status["hosts"].get("127.0.0.1"), f"rotate kept {rotated}")
+        return f"proxy {egress} used and ledgered, rotated to {rotated}"
+    finally:
+        if previous is None:
+            os.environ.pop("ARIAX_PROXIES", None)
+        else:
+            os.environ["ARIAX_PROXIES"] = previous
+
+
+@check("A22", "humanised input: pointer drift, then a real click on an element")
+def a22(h: Harness) -> str:
+    from aria_x.tools import browser
+    if not browser.browser_path():
+        raise AssertionError("no chrome installed")
+    opened = h.tool("browser_session", action="open", url=f"{h.base}/click", settle_ms=800,
+                    humanize=True, moves=2)
+    ok(opened.data["acted"], "no interaction recorded")
+    ok(opened.data["acted"].get("moves", 0) > 5, f"too few pointer moves: {opened.data['acted']}")
+    ok(opened.data["acted"].get("scrolled", 0) >= 1, "no scroll")
+    clicked = h.tool("browser_session", action="click", selector="#go")
+    ok("clicked-ok" in (clicked.data.get("excerpt") or ""), "click had no effect on the DOM")
+    h.tool("browser_session", action="close")
+    return (f"{opened.data['acted']['moves']} pointer moves, {opened.data['acted']['scrolled']}"
+            f" scroll(s), click changed the DOM")
+
+
+@check("A23", "egress failover: a dead proxy parks and the request still succeeds")
+def a23(h: Harness) -> str:
+    import os
+    previous = os.environ.get("ARIAX_PROXIES")
+    os.environ["ARIAX_PROXIES"] = "http://127.0.0.1:9,http://127.0.0.1:8901"
+    os.environ["ARIAX_EGRESS"] = "rotate"   # a fresh pick per request: the dead one will come up
+    try:
+        h.tool("egress", action="rotate", host="127.0.0.1")
+        codes = []
+        for _ in range(6):   # rotate picks per request, so both egresses come up
+            codes.append(h.tool("http_request", url=f"{h.base}/echo").data.get("status"))
+        ok(200 in codes, f"no request got through: {codes}")
+        status = h.tool("egress", action="status").data
+        dead = next(p for p in status["proxies"] if p["proxy"].endswith(":9"))
+        ok(dead["failures"] >= 1 or not dead["alive"], "dead proxy never marked")
+        return f"dead proxy parked after {dead['failures']} failure(s); {codes.count(200)}/6 served"
+    finally:
+        os.environ["ARIAX_EGRESS"] = "sticky"
+        if previous is None:
+            os.environ.pop("ARIAX_PROXIES", None)
+        else:
+            os.environ["ARIAX_PROXIES"] = previous
+
+
 def main(argv: list[str]) -> int:
     for stream in (sys.stdout, sys.stderr):
         try:
@@ -403,6 +493,8 @@ def main(argv: list[str]) -> int:
                 print(f"FAIL {code}  {title}\n        {exc}")
     finally:
         harness.close()
+    for process in _PROXIES:
+        process.terminate()
     total = len([c for c, _ in CHECKS if not wanted or c in wanted])
     print(f"\n{total - failures}/{total} checks passed")
     return 1 if failures else 0

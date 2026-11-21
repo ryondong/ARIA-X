@@ -7,7 +7,7 @@ stdin and a JSON response on stdout. Keeping it out of process also means a
 libcurl crash cannot take the engine with it.
 
 Request:  {url, method, headers: [[k, v], ...], body_b64, timeout, max_bytes,
-           follow, impersonate, http_version}
+           follow, impersonate, http_version, proxy}
 Response: {status, headers: {k: v}, body_b64, elapsed_ms, transport, error}
 """
 
@@ -43,6 +43,8 @@ def main() -> int:
             http_version=(CurlHttpVersion.V2_0 if spec.get("http_version") != "1.1"
                           else CurlHttpVersion.V1_1),
             verify=True,
+            proxies=({"http": spec["proxy"], "https": spec["proxy"]}
+                     if spec.get("proxy") else None),
         )
     except Exception as exc:  # noqa: BLE001 - libcurl raises its own hierarchy
         print(json.dumps({"error": f"{type(exc).__name__}: {exc}"}))

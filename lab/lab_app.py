@@ -251,6 +251,11 @@ class Handler(BaseHTTPRequestHandler):
             return self.otp(path.rsplit("/", 1)[1])
         if path.startswith("/secure/"):
             return self.secure(path.rsplit("/", 1)[1])
+        if path == "/click":
+            return self.send(200, (
+                "<html><title>Click me</title><body><h1 id='out'>idle</h1>"
+                "<button id='go' onclick=\"document.getElementById('out').textContent='clicked-ok'\">go</button>"
+                "</body></html>"))
         if path == "/echo":
             return self.send(200, json.dumps({"headers": list(self.headers.items()),
                                               "path": self.path}), "application/json")
@@ -312,6 +317,11 @@ class Handler(BaseHTTPRequestHandler):
             return self.otp(path.rsplit("/", 1)[1])
         if path.startswith("/secure/"):
             return self.secure(path.rsplit("/", 1)[1])
+        if path == "/click":
+            return self.send(200, (
+                "<html><title>Click me</title><body><h1 id='out'>idle</h1>"
+                "<button id='go' onclick=\"document.getElementById('out').textContent='clicked-ok'\">go</button>"
+                "</body></html>"))
         if path == "/echo":
             return self.send(200, json.dumps({"headers": list(self.headers.items()),
                                               "path": self.path}), "application/json")

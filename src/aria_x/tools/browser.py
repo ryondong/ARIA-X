@@ -28,6 +28,7 @@ from __future__ import annotations
 import base64
 import json
 import os
+import random
 import secrets
 import shutil
 import socket
@@ -220,7 +221,7 @@ window.chrome = window.chrome || {runtime: {}};
 
 
 def launch(workdir: Path, *, width: int = 1280, height: int = 900,
-           user_agent: str = "") -> dict[str, Any]:
+           user_agent: str = "", proxy: str = "") -> dict[str, Any]:
     """Start headless Chrome with a throwaway profile. Returns connection info."""
     binary = browser_path()
     if not binary:
@@ -234,6 +235,8 @@ def launch(workdir: Path, *, width: int = 1280, height: int = 900,
             "--disable-features=Translate,BackForwardCache", "--enable-features=NetworkService",
             f"--window-size={width},{height}", "--hide-scrollbars", "about:blank"]
     argv.insert(1, f"--user-agent={user_agent or DEFAULT_UA}")
+    if proxy:
+        argv.insert(1, f"--proxy-server={proxy}")
     flags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
     process = subprocess.Popen(argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                                creationflags=flags)
@@ -266,7 +269,7 @@ def launch(workdir: Path, *, width: int = 1280, height: int = 900,
         shutil.rmtree(profile, ignore_errors=True)
         raise OSError("devtools browser endpoint not published")
     ws = _WS("127.0.0.1", port, ws_path)
-    state = {"pid": process.pid, "port": port, "profile": str(profile),
+    state = {"pid": process.pid, "port": port, "profile": str(profile), "proxy": proxy,
              "browser_ws": ws_path, "opened_at": time.time()}
     write_state(workdir, state)
     return state
@@ -351,9 +354,18 @@ def shutdown(workdir: Path) -> bool:
 def _ensure_page(ws: _WS, workdir: Path) -> str:
     """A target + attached session for the current tab, reused when possible."""
     state = read_state(workdir)
-    session_id = state.get("session_id")
-    if session_id:
-        return session_id
+    target_id = state.get("target_id")
+    if target_id:
+        # re-attach every call: a sessionId is only valid for this websocket, so a
+        # cached one goes stale the moment the browser or the socket is replaced.
+        try:
+            attached = ws.call("Target.attachToTarget", {"targetId": target_id, "flatten": True})
+            session_id = attached["sessionId"]
+            state["session_id"] = session_id
+            write_state(workdir, state)
+            return session_id
+        except OSError:
+            state.pop("target_id", None)
     created = ws.call("Target.createTarget", {"url": "about:blank"})
     attached = ws.call("Target.attachToTarget", {"targetId": created["targetId"],
                                                  "flatten": True})
@@ -405,6 +417,81 @@ def evaluate(ws: _WS, session_id: str, expression: str) -> Any:
     out = ws.call("Runtime.evaluate", {"expression": expression, "returnByValue": True,
                                        "awaitPromise": True}, session_id=session_id, timeout=30)
     return (out.get("result") or {}).get("value")
+
+
+#: A human moves in curves with pauses, not in one jump. So does this.
+def _bezier(start: tuple[float, float], end: tuple[float, float],
+            steps: int = 12) -> list[tuple[float, float]]:
+    control = ((start[0] + end[0]) / 2 + random.uniform(-90, 90),
+               (start[1] + end[1]) / 2 + random.uniform(-70, 70))
+    points: list[tuple[float, float]] = []
+    for index in range(1, steps + 1):
+        t = index / steps
+        x = (1 - t) ** 2 * start[0] + 2 * (1 - t) * t * control[0] + t * t * end[0]
+        y = (1 - t) ** 2 * start[1] + 2 * (1 - t) * t * control[1] + t * t * end[1]
+        points.append((x + random.uniform(-0.8, 0.8), y + random.uniform(-0.8, 0.8)))
+    return points
+
+
+def humanise(ws: _WS, session_id: str, *, moves: int = 2) -> dict[str, Any]:
+    """Drift the pointer, scroll a little, breathe — the idle half of a page load."""
+    done = {"moves": 0, "scrolled": 0}
+    try:
+        size = ws.call("Runtime.evaluate",
+                       {"expression": "[innerWidth, innerHeight].join('x')",
+                        "returnByValue": True}, session_id=session_id)["result"]["value"]
+        width, height = (int(part) for part in str(size).split("x"))
+    except (OSError, KeyError, ValueError):
+        width, height = 1280, 900
+    point = (width * random.uniform(0.3, 0.7), height * random.uniform(0.3, 0.6))
+    for _ in range(moves):
+        target = (width * random.uniform(0.1, 0.9), height * random.uniform(0.1, 0.9))
+        for x, y in _bezier(point, target):
+            ws.call("Input.dispatchMouseEvent", {"type": "mouseMoved", "x": round(x, 1),
+                                                 "y": round(y, 1)}, session_id=session_id)
+            done["moves"] += 1
+            time.sleep(random.uniform(0.008, 0.03))
+        point = target
+        time.sleep(random.uniform(0.15, 0.5))
+    for _ in range(random.randint(1, 3)):
+        ws.call("Input.dispatchMouseEvent", {
+            "type": "mouseWheel", "x": round(point[0], 1), "y": round(point[1], 1),
+            "deltaX": 0, "deltaY": random.randint(80, 260)}, session_id=session_id)
+        done["scrolled"] += 1
+        time.sleep(random.uniform(0.2, 0.6))
+    return done
+
+
+def click(ws: _WS, session_id: str, selector: str) -> dict[str, Any]:
+    """Click an element the way a hand would: travel to it, press, release."""
+    box = ws.call("Runtime.evaluate", {
+        "expression": ("(() => { const el = document.querySelector(" + json.dumps(selector) +
+                       "); if (!el) return null; el.scrollIntoView({block: 'center'});"
+                       " const r = el.getBoundingClientRect();"
+                       " return [r.x + r.width/2, r.y + r.height/2].join(','); })()"),
+        "returnByValue": True}, session_id=session_id)["result"].get("value")
+    if not box:
+        raise OSError(f"selector not found: {selector}")
+    x, y = (float(part) for part in str(box).split(","))
+    start = (x - random.uniform(120, 320), y - random.uniform(80, 220))
+    for px, py in _bezier(start, (x, y), steps=14):
+        ws.call("Input.dispatchMouseEvent", {"type": "mouseMoved", "x": round(px, 1),
+                                             "y": round(py, 1)}, session_id=session_id)
+        time.sleep(random.uniform(0.008, 0.025))
+    ws.call("Input.dispatchMouseEvent", {"type": "mousePressed", "x": x, "y": y, "button": "left",
+                                         "clickCount": 1}, session_id=session_id)
+    time.sleep(random.uniform(0.05, 0.14))
+    ws.call("Input.dispatchMouseEvent", {"type": "mouseReleased", "x": x, "y": y, "button": "left",
+                                         "clickCount": 1}, session_id=session_id)
+    return {"selector": selector, "x": x, "y": y}
+
+
+def type_text(ws: _WS, session_id: str, text: str) -> int:
+    """Per-character typing with human inter-key gaps (insertText keeps it cheap)."""
+    for char in text:
+        ws.call("Input.insertText", {"text": char}, session_id=session_id)
+        time.sleep(random.uniform(0.03, 0.11))
+    return len(text)
 
 
 def screenshot(ws: _WS, session_id: str, path: Path) -> int:

@@ -286,7 +286,7 @@ def next_delay(workdir: Path, kind: str, *, scale: float = 1.0) -> float:
 
 
 def record(workdir: Path, *, url: str, kind: str, status: int, size: int, elapsed_ms: int,
-           transport: str, fingerprint: str, challenge: str = "") -> None:
+           transport: str, fingerprint: str, challenge: str = "", egress: str = "") -> None:
     """Ledger row. Cheap, and the only source of the audit numbers."""
     data = load(workdir)
     data.setdefault("by_class", {})
@@ -299,6 +299,11 @@ def record(workdir: Path, *, url: str, kind: str, status: int, size: int, elapse
     data["last_at"] = time.time()
     data["transport"] = transport
     data["fingerprint"] = fingerprint
+    if egress:
+        data["egress"] = egress
+        distinct = data.setdefault("distinct_egress", [])
+        if egress not in distinct:
+            distinct.append(egress)
     host = urllib.parse.urlsplit(url).hostname or ""
     hosts = data.setdefault("hosts", {})
     host_row = hosts.setdefault(host, {"requests": 0, "challenges": 0, "rate_limited": 0,
@@ -361,6 +366,8 @@ def audit(workdir: Path) -> dict[str, Any]:
         "persona": data.get("persona", ""),
         "transport": data.get("transport", ""),
         "fingerprint": data.get("fingerprint", ""),
+        "egress": data.get("egress", "") or "direct",
+        "distinct_egress": data.get("distinct_egress") or [],
         "requests": data.get("requests", 0),
         "bytes": data.get("bytes", 0),
         "by_class": by_class,
@@ -370,7 +377,9 @@ def audit(workdir: Path) -> dict[str, Any]:
         "capabilities": caps,
         "residual_risks": [
             "access logs exist on the server; 'unseen' means indistinguishable, not invisible",
-            "the egress IP and its ASN are constant and are the strongest correlate",
+            ("the egress IP is a single constant address" if not data.get("distinct_egress")
+             else f"{len(data.get('distinct_egress') or [])} egress(es) used; they can still be"
+                  " correlated by ASN or by timing"),
             "no JS means no browser telemetry the score-based systems expect (v3 captcha);"
             " browser lane fixes that at a cost",
             "TLS session resumption and TCP characteristics still differ from a browser on the"

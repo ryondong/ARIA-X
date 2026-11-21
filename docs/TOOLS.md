@@ -43,6 +43,7 @@
 | `code_probe` | medium | 是 | `url` | 有界验证码/令牌枚举，报告覆盖率与速率 |
 | `id_walk` | medium | 是 | `url` | 对象引用遍历，按偏离中位数排序 |
 | `vault` | low | — | `action` | 运行级密文存储（防证据脱敏丢失） |
+| `egress` | low | 是 | `action` | 出口池状态/轮换/自检（sticky 绑定主机，失败自动换线） |
 | `http_fetch` | medium | 是 | `url` | 升阶抓取：指纹伪装 → 必要时无头浏览器 |
 | `stealth_audit` | low | — | — | 人员/传输/字节分类/挑战计数/残余风险 |
 | `jwt_sign` | low | — | `alg`, `claims` | 签发 none/HS*/RS*/ES256；HS+公钥=算法混淆 |

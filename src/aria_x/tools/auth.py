@@ -45,6 +45,7 @@ from ..util import json_dumps, json_loads, now_iso, redact, truncate
 from .base import ToolContext, ToolRegistry, ToolResult, ToolSpec
 from . import browser as br
 from . import challenge as chal
+from . import egress
 from . import stealth
 from . import jwtkeys
 from .net import (_ALLOWED_METHODS, DEFAULT_HTTP_TIMEOUT, MAX_EVIDENCE_EXCERPT, MAX_HTTP_BYTES,
@@ -279,7 +280,8 @@ def _dispatch(ctx: ToolContext, *, url: str, method: str = "GET",
               body: str | None = None, session: str = "", follow: bool = False,
               timeout: float = DEFAULT_HTTP_TIMEOUT, max_bytes: int = 65536,
               jar: http.cookiejar.MozillaCookieJar | None = None, client: str = "",
-              curl_extra: str = "") -> dict[str, Any]:
+              curl_extra: str = "", proxy_override: str | None = None,
+              failover: bool = True) -> dict[str, Any]:
     """One scoped, rate-limited, bounded request. Never raises for 4xx/5xx.
 
     ``client='curl'`` shells out to curl when the sandbox is local: that buys
@@ -304,13 +306,14 @@ def _dispatch(ctx: ToolContext, *, url: str, method: str = "GET",
     else:
         kind = "api"
 
+    proxy = proxy_override if proxy_override is not None else egress.choose(workdir, host_for_pace)
     chosen = client.lower()
     if chosen in {"", "auto"}:
         chosen = "impersonate" if stealth.impersonate_python() else ""
     if chosen == "impersonate":
         result = _send_impersonate(ctx, url=url, method=method.upper(), headers=headers,
                                    body=body, follow=False, timeout=timeout,
-                                   max_bytes=max_bytes, jar=jar)
+                                   max_bytes=max_bytes, jar=jar, proxy=proxy, failover=failover)
         if not result.get("transport_unavailable"):
             if stealth_on:
                 stealth.record(workdir, url=url, kind=kind, status=result.get("status") or 0,
@@ -321,7 +324,7 @@ def _dispatch(ctx: ToolContext, *, url: str, method: str = "GET",
     if client.lower() == "curl" and getattr(ctx.sandbox, "backend", "") in _CURL_BACKENDS:
         result = _send_curl(ctx, url=url, method=method.upper(), headers=headers, body=body,
                             follow=False, timeout=timeout, max_bytes=max_bytes, jar=jar,
-                            extra=curl_extra)
+                            extra=curl_extra, proxy=proxy, failover=failover)
         if not result.get("curl_unavailable"):
             if stealth_on:
                 stealth.record(workdir, url=url, kind=kind, status=result.get("status") or 0,
@@ -338,7 +341,10 @@ def _dispatch(ctx: ToolContext, *, url: str, method: str = "GET",
     # urllib cannot decode brotli; do not advertise it on that transport
     polite = stealth.headers_for(workdir, url, method,
                                  encodings="gzip, deflate") if stealth_on else {}
-    request_headers = {**polite}
+    if proxy:
+        request_headers = {**polite}
+    else:
+        request_headers = {**polite}
     request_headers.update(_headers(headers, keep_host=True))
     if not stealth_on:
         request_headers.setdefault("User-Agent", "ARIA-X/0.1 (authorized security research)")
@@ -353,7 +359,7 @@ def _dispatch(ctx: ToolContext, *, url: str, method: str = "GET",
     started = time.monotonic()
     try:
         request = urllib.request.Request(url, data=data, headers=request_headers, method=method)
-        handlers: list[Any] = [urllib.request.ProxyHandler({})]
+        handlers: list[Any] = [egress.urllib_handler(proxy)]
         if jar is not None:
             handlers.append(urllib.request.HTTPCookieProcessor(jar))
         redirects: list[dict[str, Any]] = []
@@ -367,6 +373,18 @@ def _dispatch(ctx: ToolContext, *, url: str, method: str = "GET",
             row["error"] = str(getattr(exc, "reason", exc))
             row["ms"] = int((time.monotonic() - started) * 1000)
             audit(ctx, "http_request", "error", url, {"error": row["error"]})
+            if proxy and "timed out" not in row["error"]:
+                egress.failed(workdir, proxy, host_for_pace)   # dead line: park it
+                if failover:
+                    alt = egress.choose(workdir, host_for_pace)
+                    if alt and alt != proxy:
+                        retry = _dispatch(ctx, url=url, method=method, headers=headers,
+                                          body=body, session=session, follow=follow,
+                                          timeout=timeout, max_bytes=max_bytes, jar=jar,
+                                          client=client, curl_extra=curl_extra,
+                                          proxy_override=alt, failover=False)
+                        retry["failover_from"] = egress.mask(proxy)
+                        return retry
             return row
         except (socket.timeout, TimeoutError):
             row["error"] = "timeout"
@@ -413,8 +431,11 @@ def _dispatch(ctx: ToolContext, *, url: str, method: str = "GET",
     if stealth_on:
         stealth.record(workdir, url=url, kind=stealth.classify(url), status=status,
                        size=len(raw), elapsed_ms=elapsed_ms, transport="urllib",
-                       fingerprint="python-ssl/ja3",
+                       fingerprint="python-ssl/ja3", egress=egress.mask(proxy),
                        challenge=(flagged or {}).get("vendor", ""))
+        if proxy:
+            egress.used(workdir, proxy, host_for_pace)
+            row["egress"] = egress.mask(proxy)
         row["transport"] = "urllib"
         if status in (429, 503):
             retry_after = response_headers.get("Retry-After", "")
@@ -427,9 +448,31 @@ def _dispatch(ctx: ToolContext, *, url: str, method: str = "GET",
     return row
 
 
+def _failover(ctx: ToolContext, row: dict[str, Any], proxy: str, workdir: Path, host: str,
+              *, failover: bool, url: str, method: str, headers: dict[str, str] | None,
+              body: str | None, session: str, follow: bool, timeout: float, max_bytes: int,
+              jar: http.cookiejar.MozillaCookieJar | None, client: str,
+              curl_extra: str) -> dict[str, Any]:
+    """Park a broken egress and retry once on another. One retry, never a loop."""
+    if not proxy or not failover or not row.get("error"):
+        if proxy and row.get("error"):
+            egress.failed(workdir, proxy, host)
+        return row
+    egress.failed(workdir, proxy, host)
+    alt = egress.choose(workdir, host)
+    if not alt or alt == proxy:
+        return row
+    retry = _dispatch(ctx, url=url, method=method, headers=headers, body=body, session=session,
+                      follow=follow, timeout=timeout, max_bytes=max_bytes, jar=jar,
+                      client=client, curl_extra=curl_extra, proxy_override=alt, failover=False)
+    retry["failover_from"] = egress.mask(proxy)
+    return retry
+
+
 def _send_impersonate(ctx: ToolContext, *, url: str, method: str, headers: dict[str, str] | None,
                       body: str | None, follow: bool, timeout: float, max_bytes: int,
-                      jar: http.cookiejar.MozillaCookieJar | None) -> dict[str, Any]:
+                      jar: http.cookiejar.MozillaCookieJar | None,
+                      proxy: str = "", failover: bool = True) -> dict[str, Any]:
     """The request through libcurl-impersonate: Chrome's TLS and h2 fingerprint."""
     python = stealth.impersonate_python()
     if not python:
@@ -455,6 +498,7 @@ def _send_impersonate(ctx: ToolContext, *, url: str, method: str, headers: dict[
         "body_b64": base64.b64encode(body.encode()).decode() if body else "",
         "timeout": timeout, "max_bytes": max_bytes, "follow": follow,
         "impersonate": str(__import__("os").environ.get("ARIAX_IMPERSONATE") or "chrome"),
+        "proxy": proxy,
     })
     started = time.monotonic()
     try:
@@ -470,7 +514,10 @@ def _send_impersonate(ctx: ToolContext, *, url: str, method: str, headers: dict[
         row: dict[str, Any] = {"url": url, "method": method, "status": 0,
                               "error": str(payload["error"])[:300],
                               "ms": int((time.monotonic() - started) * 1000)}
-        return row
+        return _failover(ctx, row, proxy, Path(ctx.workdir), host, failover=failover, url=url,
+                         method=method, headers=headers, body=body, session="", follow=follow,
+                         timeout=timeout, max_bytes=max_bytes, jar=jar, client="impersonate",
+                         curl_extra="")
 
     raw = base64.b64decode(payload.get("body_b64") or "")
     response_headers = {str(k): str(v) for k, v in (payload.get("headers") or {}).items()}
@@ -488,6 +535,8 @@ def _send_impersonate(ctx: ToolContext, *, url: str, method: str, headers: dict[
                         domain_specified=False, domain_initial_dot=False, path="/",
                         path_specified=True, secure=parts.scheme == "https", expires=None,
                         discard=True, comment=None, comment_url=None, rest={}, rfc2109=False))
+    if proxy:
+        egress.used(Path(ctx.workdir), proxy, host)
     row = {
         "url": url, "method": method, "status": int(payload.get("status") or 0),
         "ms": int(payload.get("elapsed_ms") or 0), "length": len(raw),
@@ -499,6 +548,14 @@ def _send_impersonate(ctx: ToolContext, *, url: str, method: str, headers: dict[
     flagged = chal.detect(row["status"], response_headers, body_text)
     if flagged:
         row["challenge"] = flagged
+    row["transport"] = "impersonate"
+    if proxy:
+        row["egress"] = egress.mask(proxy)
+        egress.used(Path(ctx.workdir), proxy, host)
+    stealth.record(Path(ctx.workdir), url=url, kind=stealth.classify(url), status=row["status"],
+                   size=len(raw), elapsed_ms=row["ms"], transport="impersonate",
+                   fingerprint="chrome/ja3+ja4+h2", egress=egress.mask(proxy),
+                   challenge=(flagged or {}).get("vendor", ""))
     return row
 
 
@@ -508,7 +565,8 @@ _CURL_FORMAT = "%{http_code} %{size_download} %{time_total} %{content_type}"
 
 def _send_curl(ctx: ToolContext, *, url: str, method: str, headers: dict[str, str] | None,
                body: str | None, follow: bool, timeout: float, max_bytes: int,
-               jar: http.cookiejar.MozillaCookieJar | None, extra: str) -> dict[str, Any]:
+               jar: http.cookiejar.MozillaCookieJar | None, extra: str,
+               proxy: str = "", failover: bool = True) -> dict[str, Any]:
     """Same contract as the urllib path, executed through the local curl binary."""
     import shlex
 
@@ -545,6 +603,7 @@ def _send_curl(ctx: ToolContext, *, url: str, method: str, headers: dict[str, st
         payload_path = state / f"curl_{stamp}.data"
         payload_path.write_bytes(data)
         argv += ["--data-binary", f"@{payload_path.as_posix()}"]
+    argv += egress.curl_flags(proxy)
     if extra:
         argv += shlex.split(extra)
     argv.append(url)
@@ -562,12 +621,12 @@ def _send_curl(ctx: ToolContext, *, url: str, method: str, headers: dict[str, st
         row["status"] = int(fields[0] or 0)
     except (ValueError, IndexError):
         row["status"] = 0
-    if run.timed_out:
-        row["error"] = "curl timeout"
-        return row
-    if row["status"] == 0 and run.stderr:
-        row["error"] = truncate(run.stderr.strip(), 300)
-        return row
+    if run.timed_out or (row["status"] == 0 and run.stderr):
+        row["error"] = "curl timeout" if run.timed_out else truncate(run.stderr.strip(), 300)
+        return _failover(ctx, row, proxy, Path(ctx.workdir), host, failover=failover, url=url,
+                         method=method, headers=headers, body=body, session="", follow=follow,
+                         timeout=timeout, max_bytes=max_bytes, jar=jar, client="curl",
+                         curl_extra=extra)
 
     response_headers: dict[str, str] = {}
     try:
@@ -601,6 +660,14 @@ def _send_curl(ctx: ToolContext, *, url: str, method: str, headers: dict[str, st
     flagged = chal.detect(row["status"], response_headers, body_text)
     if flagged:
         row["challenge"] = flagged
+    row["transport"] = "impersonate"
+    if proxy:
+        row["egress"] = egress.mask(proxy)
+        egress.used(Path(ctx.workdir), proxy, host)
+    stealth.record(Path(ctx.workdir), url=url, kind=stealth.classify(url), status=row["status"],
+                   size=len(raw), elapsed_ms=row["ms"], transport="impersonate",
+                   fingerprint="chrome/ja3+ja4+h2", egress=egress.mask(proxy),
+                   challenge=(flagged or {}).get("vendor", ""))
     return row
 
 
@@ -1718,7 +1785,8 @@ def browser_session(ctx: ToolContext, kwargs: dict[str, Any]) -> ToolResult:
 
     if action in {"open", "read", "cookies", "eval", "shot"} and not state.get("browser_ws"):
         try:
-            br.launch(Path(ctx.workdir), user_agent=str(kwargs.get("user_agent") or ""))
+            br.launch(Path(ctx.workdir), user_agent=str(kwargs.get("user_agent") or ""),
+                      proxy=kwargs.get("proxy") or egress.choose(Path(ctx.workdir), "browser"))
         except OSError as exc:
             return ToolResult.failure(f"browser launch failed: {exc}")
 
@@ -1729,6 +1797,21 @@ def browser_session(ctx: ToolContext, kwargs: dict[str, Any]) -> ToolResult:
     try:
         session_id = br._ensure_page(ws, Path(ctx.workdir))
         url = str(kwargs.get("url") or "").strip()
+
+        if action == "click":
+            selector = str(kwargs.get("selector") or "")
+            if not selector:
+                return ToolResult.failure("selector is required for click")
+            acted: dict[str, Any] = {"clicked": br.click(ws, session_id, selector)}
+            if kwargs.get("type"):
+                acted["typed"] = br.type_text(ws, session_id, str(kwargs["type"]))
+            time.sleep(0.6)
+            doc = br.document(ws, session_id)
+            return ToolResult.success({"selector": selector, **acted, "title": doc.get("title"),
+                                       "excerpt": truncate(re.sub(r"\s+", " ", doc.get("html") or ""), 1200)},
+                                      text=f"clicked {selector}"
+                                           + (f", typed {acted['typed']} chars"
+                                              if acted.get("typed") else ""))
 
         if action == "eval":
             expression = str(kwargs.get("expression") or "1")
@@ -1788,6 +1871,8 @@ def browser_session(ctx: ToolContext, kwargs: dict[str, Any]) -> ToolResult:
 
         decision = ctx.scope.require_url(url)
         ctx.scope.acquire_slot(decision.host or "")
+        browser_egress = egress.mask(str(kwargs.get("proxy") or
+                                         (br.read_state(Path(ctx.workdir)).get("proxy") or "")))
 
         # The browser IS the solver: give the challenge script room to finish and
         # re-read until it clears or the patience budget is gone. A captcha widget
@@ -1812,6 +1897,23 @@ def browser_session(ctx: ToolContext, kwargs: dict[str, Any]) -> ToolResult:
                 if rounds >= 4 or time.monotonic() > deadline - patience / 3:
                     break
             time.sleep(2.0 if wall.get("kind") == "js-challenge" else 3.0)
+
+        acted: dict[str, Any] = {}
+        if kwargs.get("humanize", True):
+            try:
+                acted = br.humanise(ws, session_id,
+                                    moves=clamp_int(kwargs.get("moves"), 0, 8, 2))
+            except (OSError, ValueError):
+                acted = {}
+        if kwargs.get("selector"):
+            try:
+                acted["clicked"] = br.click(ws, session_id, str(kwargs["selector"]))
+                time.sleep(0.8)
+                doc = br.document(ws, session_id)
+                if kwargs.get("type"):
+                    acted["typed"] = br.type_text(ws, session_id, str(kwargs["type"]))
+            except (OSError, ValueError) as exc:
+                acted["click_error"] = str(exc)[:160]
 
         html = doc.get("html") or ""
         host = decision.host or ""
@@ -1845,6 +1947,10 @@ def browser_session(ctx: ToolContext, kwargs: dict[str, Any]) -> ToolResult:
                     sessions[target]["note"] = "seeded by browser_session (UA carried)"
                     _write_sessions(ctx, sessions)
 
+        stealth.record(Path(ctx.workdir), url=url, kind=stealth.classify(url), status=200,
+                       size=len(html), elapsed_ms=0, transport="browser",
+                       fingerprint="real chrome", egress=browser_egress,
+                       challenge=(wall or {}).get("vendor", ""))
         shot = ""
         if kwargs.get("screenshot"):
             path = Path(ctx.workdir) / "evidence" / f"shot_{int(time.time() * 1000)}.png"
@@ -1858,14 +1964,17 @@ def browser_session(ctx: ToolContext, kwargs: dict[str, Any]) -> ToolResult:
         evidence = _save_evidence(ctx, {"url": url, "final_url": doc.get("url"),
                                         "title": doc.get("title"), "challenge": wall,
                                         "rounds": rounds, "imported_cookies": imported_cookies,
-                                        "html_excerpt": excerpt, "screenshot": shot or None},
+                                        "html_excerpt": excerpt, "screenshot": shot or None,
+                                        "acted": acted or None},
                                   prefix="browser")
         payload: dict[str, Any] = {
             "url": url, "final_url": doc.get("url"), "title": doc.get("title"),
             "html_bytes": len(html), "rounds": rounds,
             "challenge": chal.describe(wall) if wall else "",
             "cleared": bool(wall is None),
-            "imported_cookies": imported_cookies, "screenshot": shot or None, "excerpt": excerpt}
+            "imported_cookies": imported_cookies, "screenshot": shot or None,
+            "excerpt": excerpt, "acted": acted or None,
+            "egress": egress.mask(str(kwargs.get("proxy") or "")) or "direct"}
         if evidence:
             payload["evidence_path"] = evidence
         text = (f"{doc.get('title') or '(no title)'} — {doc.get('url') or url}\n"
@@ -2010,7 +2119,8 @@ def http_fetch(ctx: ToolContext, kwargs: dict[str, Any]) -> ToolResult:
                   body=kwargs.get("body"), timeout=clamp_float(kwargs.get("timeout"), 1, 90, 20),
                   max_bytes=clamp_int(kwargs.get("max_bytes"), 256, MAX_HTTP_BYTES, 131072))
     rungs.append({"rung": "http", "transport": first.get("transport") or "urllib",
-                  "status": first.get("status"), "wall": chal.describe(first.get("challenge"))
+                  "status": first.get("status"), "egress": first.get("egress") or "direct",
+                  "wall": chal.describe(first.get("challenge"))
                   if first.get("challenge") else ""})
     if first.get("status") and not first.get("challenge"):
         payload = row_payload(ctx, first, headers=kwargs.get("headers"), body=kwargs.get("body"))
@@ -2049,6 +2159,60 @@ def http_fetch(ctx: ToolContext, kwargs: dict[str, Any]) -> ToolResult:
         f"walled for HTTP, cleared by the browser after {len(rungs)} rung(s); "
         f"cookies {payload['cookies']} in session '{session_name}'\n\n"
         f"{payload['excerpt']}", 9000))
+
+
+
+
+# ---------------------------------------------------------------------------
+# tools: egress pool
+# ---------------------------------------------------------------------------
+
+
+def egress_tool(ctx: ToolContext, kwargs: dict[str, Any]) -> ToolResult:
+    """Inspect or move the egress. Sticky by default; rotate on demand."""
+    workdir = Path(ctx.workdir)
+    action = str(kwargs.get("action") or "status").lower()
+    if action == "status":
+        report = egress.status(workdir)
+        lines = [f"strategy {report['strategy']} · {report['configured']} configured · "
+                 f"{report['note']}"]
+        for row in report["proxies"]:
+            lines.append(f"  {row['proxy']:<44} uses {row['uses']:<4} fails {row['failures']}"
+                         f" {'alive' if row['alive'] else 'COOLING'}")
+        for host, proxy in report["hosts"].items():
+            lines.append(f"  host {host} -> {proxy}")
+        evidence = _save_evidence(ctx, report, prefix="egress")
+        payload = dict(report)
+        if evidence:
+            payload["evidence_path"] = evidence
+        return ToolResult.success(payload, text="\n".join(lines))
+    if action == "rotate":
+        host = str(kwargs.get("host") or "").strip()
+        if not host:
+            return ToolResult.failure("host is required for rotate")
+        picked = egress.rotate(workdir, host)
+        return ToolResult.success({"host": host, "egress": egress.mask(picked) or "direct"},
+                                  text=f"{host} -> {egress.mask(picked) or 'direct'}")
+    if action == "check":
+        host = str(kwargs.get("host") or "").strip()
+        if not host:
+            return ToolResult.failure("host is required for check")
+        probes = []
+        for proxy in egress.pool() or [""]:
+            row = _send(ctx, url=str(kwargs.get("url") or "https://api.ipify.org?format=json"),
+                        timeout=clamp_float(kwargs.get("timeout"), 2, 30, 12), max_bytes=4096,
+                        proxy_override=proxy)
+            body = (row.get("body") or "").strip()[:60]
+            probes.append({"egress": egress.mask(proxy) or "direct",
+                           "status": row.get("status"), "error": row.get("error"), "body": body})
+            if proxy and not row.get("status"):
+                egress.failed(workdir, proxy, host)
+        return ToolResult.success({"host": host, "probes": probes},
+                                  text="\n".join(f"  {p['egress']:<44} {p['status'] or 'ERR'}"
+                                                  f" {p['body'] or p['error'] or ''}"
+                                                  for p in probes))
+    return ToolResult.failure(f"unknown action '{action}'",
+                              data={"actions": ["status", "rotate", "check"]})
 
 
 # ---------------------------------------------------------------------------
@@ -2239,11 +2403,17 @@ def register(registry: ToolRegistry) -> None:
             "the page's own challenge script, waits (wait seconds, default 12) and re-reads until the "
             "wall clears or patience runs out. Returns the RENDERED DOM, title and final URL — content "
             "that never exists in the raw HTTP body. import_to=<session> harvests the minted cookies "
-            "into a jar so the plain HTTP tools can take over afterwards. Also eval/shot/close. Target "
-            "navigations are scope-checked; sub-resources are not."
+            "into a jar so the plain HTTP tools can take over afterwards. humanize (default true) "
+            "drifts the pointer and scrolls like a hand; selector/type click and type after the wall "
+            "settles. Also eval/shot/close. Target navigations are scope-checked; sub-resources "
+            "are not."
         ),
         parameters={"type": "object", "properties": {
-            "action": {"type": "string", "enum": ["open", "read", "cookies", "eval", "shot", "close"]},
+            "action": {"type": "string", "enum": ["open", "read", "cookies", "eval", "shot",
+                                                 "click", "close"]},
+            "selector": {"type": "string"}, "type": {"type": "string"},
+            "humanize": {"type": "boolean"}, "moves": {"type": "integer"},
+            "proxy": {"type": "string"},
             "url": {"type": "string"}, "wait": {"type": "number"},
             "settle_ms": {"type": "integer"}, "import_to": {"type": "string"},
             "host": {"type": "string"}, "expression": {"type": "string"},
@@ -2299,3 +2469,19 @@ def register(registry: ToolRegistry) -> None:
             "required": ["url"]},
         risk="medium", tags=("network", "http", "stealth", "escalation"), requires_scope=True,
     ), http_fetch)
+
+    registry.add(ToolSpec(
+        name="egress",
+        description=(
+            "Inspect or move the egress. action=status lists the pool with per-proxy use and "
+            "failure counts; action=rotate host=X forces a different egress for that host; "
+            "action=check host=X probes the configured egresses. Configuration is environment "
+            "only: ARIAX_PROXIES or ARIAX_PROXY_FILE, ARIAX_EGRESS=sticky|rotate|off."
+        ),
+        parameters={"type": "object", "properties": {
+            "action": {"type": "string", "enum": ["status", "rotate", "check"]},
+            "host": {"type": "string"}, "url": {"type": "string"},
+            "timeout": {"type": "number"}},
+            "required": ["action"]},
+        risk="low", tags=("network", "stealth", "egress"), requires_scope=True,
+    ), egress_tool)
