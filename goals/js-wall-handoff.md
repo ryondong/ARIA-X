@@ -1,0 +1,3 @@
+Run browser_session action=open url=http://127.0.0.1:8899/js/42 wait=20 import_to=js2 settle_ms=1200 to clear the JS wall and harvest its clearance cookie into session js2.
+
+Then run code_probe url=http://127.0.0.1:8899/js/{} length=2 max_attempts=100 match='"ok": ?true' session=js2. If it reports blocked=false and finds 42, record ONE high finding citing the code_probe evidence_path: the browser's clearance cookie lets ordinary HTTP finish the enumeration, so the wall is a one-off cost rather than a dead end (CWE-307 with CWE-804). Report attempts and that no further browser round was needed. Then stop.

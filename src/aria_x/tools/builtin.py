@@ -22,7 +22,7 @@ TOOL_NAMES: tuple[str, ...] = (
     "http_request", "dns_lookup", "port_scan", "tls_probe", "web_probe", "web_search",
     # auth neighbourhood: session continuity, differentials, JWTs, mining, recovery
     "http_session", "http_matrix", "jwt_inspect", "route_mine", "artifact_probe",
-    "code_probe", "id_walk", "vault",
+    "code_probe", "id_walk", "vault", "jwt_sign", "browser_session",
     "add_fact", "add_finding", "add_asset", "anchor_node", "graph_query", "search_traces",
     "memory_store", "memory_search", "todo_update", "prove_goal",
     "delegate_specialist", "scope_check",

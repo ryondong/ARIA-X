@@ -43,6 +43,8 @@
 | `code_probe` | medium | 是 | `url` | 有界验证码/令牌枚举，报告覆盖率与速率 |
 | `id_walk` | medium | 是 | `url` | 对象引用遍历，按偏离中位数排序 |
 | `vault` | low | — | `action` | 运行级密文存储（防证据脱敏丢失） |
+| `jwt_sign` | low | — | `alg`, `claims` | 签发 none/HS*/RS*/ES256；HS+公钥=算法混淆 |
+| `browser_session` | high | 是 | `action` | 无头 Chrome/CDP：唯一能过 JS 挑战的通道，返回渲染后 DOM，可回收 cookie |
 | — | — | — | — | 以上 HTTP 类工具均内建墙识别（Cloudflare/Akamai/DataDome/Imperva/AWS WAF/验证码），可 `token_from=vault:NAME\|ask\|solver` 注入令牌并重试一次；`client=curl` 走 HTTP/2 |
 | `add_fact` | low | — | `title`, `body` | 黑板写入 fact |
 | `add_finding` | medium | — | `title`, `severity`, `body` | 黑板写入 finding + 证据 |

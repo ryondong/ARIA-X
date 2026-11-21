@@ -171,6 +171,11 @@ Register exactly these names via `build_registry(ctx)` in `tools/builtin.py`:
     enumeration with baseline differential, rate/coverage/ETA reporting.
   - `id_walk(url, start/count|ids, marker?)` — object-reference walk ranked by deviation from the median.
   - `vault(action, name?, value?, reveal?)` — run-scoped secret store under `workdir/state/vault.json`.
+  - `jwt_sign(alg, claims, key_pem?, key_file?, hmac_secret?, header?, verify?)` — alg none/HS*/RS*/ES256,
+    pure stdlib; `HS*` with a public key PEM *is* algorithm confusion.
+  - `browser_session(action, url?, wait?, import_to?, expression?, host?)` — headless Chrome over CDP;
+    the only lane that clears a js-challenge (it runs the page's own script), returns the rendered DOM
+    and can harvest the minted cookies into a session jar. Target navigations are scope-checked.
 - **Bot-management lane (`tools/challenge.py`).** Every `_send` runs `challenge.detect()` on the
   response and attaches `challenge={vendor, kind, status, marker, sitekey, token_field, clearance_cookie,
   reaction}`; a 200 carrying a widget is therefore never silently read as content. `http_session`,

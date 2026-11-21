@@ -24,6 +24,8 @@ Faults planted (see lab/README.md for the probe that proves each):
   L15 session cookie set before auth completes           GET  /login
   L16 captcha wall in front of a 2-digit code            GET  /secure/{code}
   L17 local solver stand-in (returns tok-<sitekey>)      POST /solver
+  L18 RS256 JWT whose verifier trusts the header's alg   GET  /api/rs/me
+  L19 JS challenge wall that sets a clearance cookie     GET  /js/{code}
 """
 
 from __future__ import annotations
@@ -55,12 +57,23 @@ ATTEMPTS: dict[str, int] = {}
 SESSIONS: dict[str, str] = {}
 SOFT_404_BODY = b"<html><title>Not Found</title><p>The page you asked for is not here.</p></html>"
 
+KEYS = FIXTURES / "keys"
+
+# reuse the engine's own key math instead of a second copy of ASN.1 parsing
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+from aria_x.tools import jwtkeys as _jk  # noqa: E402
+
+
+def _pem(name: str) -> str:
+    return (KEYS / name).read_text(encoding="utf-8")
+
 
 def b64(raw: bytes) -> str:
     return base64.urlsafe_b64encode(raw).decode().rstrip("=")
 
 
 def make_jwt(claims: dict) -> str:
+    """HS256 with the lab's weak secret (the crackable one)."""
     head = b64(json.dumps({"alg": "HS256", "typ": "JWT"}).encode())
     body = b64(json.dumps(claims).encode())
     sig = b64(hmac.new(JWT_SECRET.encode(), f"{head}.{body}".encode(), hashlib.sha256).digest())
@@ -76,8 +89,34 @@ def check_jwt(token: str) -> dict | None:
     if not hmac.compare_digest(expected, sig):
         return None
     try:
-        pad = "=" * (-len(body) % 4)
-        return json.loads(base64.urlsafe_b64decode(body + pad))
+        return json.loads(base64.urlsafe_b64decode(body + "=" * (-len(body) % 4)))
+    except ValueError:
+        return None
+
+
+def rs256(claims: dict) -> str:
+    return _jk.sign("RS256", claims, key_pem=_pem("rsa.pem"))["token"]
+
+
+def verify_any(token: str) -> dict | None:
+    """L18: the algorithm comes out of the token, and HS* is keyed with the PUBLIC pem."""
+    try:
+        head = token.split(".")[0]
+        header = json.loads(base64.urlsafe_b64decode(head + "=" * (-len(head) % 4)))
+    except (ValueError, TypeError, IndexError):
+        return None
+    alg = str(header.get("alg") or "").upper()
+    if alg == "HS256":
+        verdict = _jk.verify(token, hmac_secret=_pem("rsa.pub"))
+    elif alg == "RS256":
+        verdict = _jk.verify(token, key_pem=_pem("rsa.pub"))
+    else:
+        return None
+    if not verdict.get("valid"):
+        return None
+    body = token.split(".")[1]
+    try:
+        return json.loads(base64.urlsafe_b64decode(body + "=" * (-len(body) % 4)))
     except ValueError:
         return None
 
@@ -210,6 +249,21 @@ class Handler(BaseHTTPRequestHandler):
             return self.otp(path.rsplit("/", 1)[1])
         if path.startswith("/secure/"):
             return self.secure(path.rsplit("/", 1)[1])
+        if path == "/api/rs/token":
+            who = query.get("user", "alice")
+            if who not in USERS:
+                return self.send(404, '{"error":"no such user"}', "application/json")
+            return self.send(200, json.dumps({"token": rs256(
+                {"sub": who, "role": USERS[who]["role"], "exp": int(time.time()) + 600})}),
+                "application/json")
+        if path == "/api/rs/me":
+            token = (self.headers.get("Authorization") or "").removeprefix("Bearer ").strip()
+            claims = verify_any(token)
+            if not claims:
+                return self.send(401, '{"error":"bad token"}', "application/json")
+            return self.send(200, json.dumps(claims), "application/json")
+        if path.startswith("/js/"):
+            return self.js_wall(path.rsplit("/", 1)[1])
         if path.startswith("/static/"):
             target = FIXTURES / "static" / path.rsplit("/", 1)[1]
             if target.exists():
@@ -250,6 +304,21 @@ class Handler(BaseHTTPRequestHandler):
             return self.otp(path.rsplit("/", 1)[1])
         if path.startswith("/secure/"):
             return self.secure(path.rsplit("/", 1)[1])
+        if path == "/api/rs/token":
+            who = query.get("user", "alice")
+            if who not in USERS:
+                return self.send(404, '{"error":"no such user"}', "application/json")
+            return self.send(200, json.dumps({"token": rs256(
+                {"sub": who, "role": USERS[who]["role"], "exp": int(time.time()) + 600})}),
+                "application/json")
+        if path == "/api/rs/me":
+            token = (self.headers.get("Authorization") or "").removeprefix("Bearer ").strip()
+            claims = verify_any(token)
+            if not claims:
+                return self.send(401, '{"error":"bad token"}', "application/json")
+            return self.send(200, json.dumps(claims), "application/json")
+        if path.startswith("/js/"):
+            return self.js_wall(path.rsplit("/", 1)[1])
         if path == "/solver":
             body = json.loads(self.raw or "{}")
             return self.send(200, json.dumps({"token": "tok-" + str(body.get("sitekey") or "")}),
@@ -274,6 +343,17 @@ class Handler(BaseHTTPRequestHandler):
             return self.send(429, '{"error":"slow down"}', "application/json",
                              {"Retry-After": "5"})
         return self.send(200, json.dumps({"ok": code == "42"}), "application/json")
+
+    def js_wall(self, code: str) -> None:
+        """L19: JS challenge — sets a clearance cookie, then reloads into JSON."""
+        jar = self.cookies()
+        if jar.get("jsok"):
+            return self.send(200, json.dumps({"ok": code == "42"}), "application/json")
+        page = ("<html><head><title>Checking your browser</title></head><body>"
+                "<div id='w'>Just a moment... cf-challenge running</div>"
+                f"<script>setTimeout(function(){{document.cookie='jsok=1;path=/';"
+                f"location.reload();}},900);</script></body></html>")
+        self.send(200, page)
 
     def secure(self, code: str) -> None:
         """L16: a hard captcha wall in front of a 2-digit code (reCAPTCHA-shaped)."""

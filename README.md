@@ -317,7 +317,7 @@ max_idle_rounds = 2
 
 ---
 
-## 内置工具目录（35 个）
+## 内置工具目录（37 个）
 
 | 类别 | 工具名称 | 风险与安全约束 |
 | :--- | :--- | :--- |
@@ -325,7 +325,7 @@ max_idle_rounds = 2
 | **交互会话（PTY）** | `session_open` (high)、`session_send` (high)、`session_read`、`session_close`、`session_list` | 驱动 msfconsole / ssh / 数据库 REPL / 反弹 shell；同一套 scope 与命令策略 |
 | **目标网络探测** | `http_request`、`dns_lookup`、`port_scan` (high)、`tls_probe`、`web_probe` | 每次调用前强制执行 `Scope` 白名单与限速校验 |
 | **外部资料检索** | `web_search` | 仅查询公开资料，不接触测试目标 |
-| **认证与授权（本地新增）** | `http_session`、`http_matrix`、`jwt_inspect`、`route_mine`、`artifact_probe`、`code_probe`、`id_walk`、`vault` | 与 `http_request` 同一 scope/限速/存证管线；Cookie 罐、差分、JWT、端点挖掘、不应暴露的文件、验证码枚举、对象引用遍历、密文存储 |
+| **认证与授权（本地新增）** | `browser_session`、`jwt_sign`、`http_session`、`http_matrix`、`jwt_inspect`、`route_mine`、`artifact_probe`、`code_probe`、`id_walk`、`vault` | 与 `http_request` 同一 scope/限速/存证管线；Cookie 罐、差分、JWT、端点挖掘、不应暴露的文件、验证码枚举、对象引用遍历、密文存储、JS 挑战、RSA/ECDSA 签发 |
 | **黑板与图谱** | `add_fact`、`add_finding`、`add_asset`、`anchor_node`、`graph_query` | 状态图节点、边与证据写入 |
 | **计划与记忆** | `todo_update`、`search_traces`、`memory_store`、`memory_search` | 跨唤醒计划维护与零依赖 TF-IDF 轨迹检索 |
 | **专家协作与诊断** | `delegate_specialist`、`prove_goal`、`scope_check` | 窄问题子代理委托、目标达成判定与 Scope 自检 |

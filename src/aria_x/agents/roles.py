@@ -57,6 +57,8 @@ RECON_TOOLS: tuple[str, ...] = (
     "code_probe",
     "id_walk",
     "vault",
+    "jwt_sign",
+    "browser_session",
 )
 
 #: Tools that mutate the blackboard / asset graph. Workers own these.
@@ -104,7 +106,8 @@ SPECIALIST_TOOLS: dict[str, tuple[str, ...]] = {
                    "route_mine", "jwt_inspect"),
     #: auth work is its own specialism: the toolset is a probing harness, not a scanner.
     "authenticator": ("http_request", "http_matrix", "http_session", "jwt_inspect",
-                      "code_probe", "id_walk", "vault", "file_read"),
+                      "jwt_sign", "code_probe", "id_walk", "vault", "browser_session",
+                      "file_read"),
     "harvester": ("artifact_probe", "route_mine", "file_read", "file_write",
                   "http_request"),
     "coder": ("terminal_exec", "session_open", "session_send", "session_read",

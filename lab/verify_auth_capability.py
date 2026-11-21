@@ -252,6 +252,64 @@ def a12(h: Harness) -> str:
     return "curl carried the differential and still honoured scope"
 
 
+@check("A13", "RS256: sign with the leaked private key, verifier accepts it")
+def a13(h: Harness) -> str:
+    keys = REPO / "lab" / "fixtures" / "keys"
+    signed = h.tool("jwt_sign", alg="RS256", claims={"sub": "alice", "role": "admin"},
+                    key_pem=(keys / "rsa.pem").read_text(), verify=True)
+    ok(signed.data["verdict"]["valid"], "self-verify failed")
+    me = h.tool("http_request", url=f"{h.base}/api/rs/me",
+                headers={"Authorization": f"Bearer {signed.data['token']}"})
+    ok(me.data["status"] == 200, "server refused a properly signed token")
+    ok('"admin"' in me.data["body_excerpt"], "claim not honoured")
+    return "RS256 token forged from the private key and honoured"
+
+
+@check("A14", "algorithm confusion: HS256 keyed with the public PEM is accepted")
+def a14(h: Harness) -> str:
+    public = (REPO / "lab" / "fixtures" / "keys" / "rsa.pub").read_text()
+    forged = h.tool("jwt_sign", alg="HS256", claims={"sub": "alice", "role": "admin"},
+                    key_pem=public, verify=True)
+    ok("confusion" in forged.data["note"], "signer did not flag the mode")
+    me = h.tool("http_request", url=f"{h.base}/api/rs/me",
+                headers={"Authorization": f"Bearer {forged.data['token']}"})
+    ok(me.data["status"] == 200, "confused token refused")
+    ok('"admin"' in me.data["body_excerpt"], "confused token lost the claim")
+    return "HS256-over-public-key accepted with role=admin"
+
+
+@check("A15", "the browser clears a JS wall that blocks plain HTTP")
+def a15(h: Harness) -> str:
+    from aria_x.tools import browser
+    if not browser.browser_path():
+        raise AssertionError("no chrome/chromium installed")
+    raw = h.tool("http_request", url=f"{h.base}/js/42")
+    ok("Just a moment" in raw.data["body_excerpt"], "lab JS wall not served")
+    opened = h.tool("browser_session", action="open", url=f"{h.base}/js/42", wait=20,
+                    import_to="jsess", settle_ms=1200)
+    ok(opened.data["cleared"], f"browser did not clear the wall: {opened.text[:120]}")
+    ok("jsok" in opened.data["imported_cookies"], "clearance cookie not harvested")
+    h.tool("browser_session", action="close")
+    return f"js-challenge cleared in {opened.data['rounds']} round(s), cookie 'jsok' kept"
+
+
+@check("A16", "harvested cookie hands the work back: plain HTTP finds the code")
+def a16(h: Harness) -> str:
+    from aria_x.tools import browser
+    if not browser.browser_path():
+        raise AssertionError("no chrome installed")
+    opened = h.tool("browser_session", action="open", url=f"{h.base}/js/42", wait=20,
+                    import_to="handoff", settle_ms=1200)
+    ok(opened.data["cleared"], "wall not cleared")
+    found = h.tool("code_probe", url=f"{h.base}/js/{{}}", length=2, max_attempts=100,
+                   match=r'"ok": ?true', session="handoff")
+    ok([row["code"] for row in found.data["found"]] == ["42"],
+       f"code not found after handoff: {found.data['found']}")
+    ok(not found.data["blocked"], "still blocked after handoff")
+    h.tool("browser_session", action="close")
+    return "cookie handoff worked; code found by plain HTTP through a JS wall"
+
+
 def main(argv: list[str]) -> int:
     wanted = {a.upper() for a in argv if not a.startswith("-")}
     harness = Harness()

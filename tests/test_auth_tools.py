@@ -305,6 +305,78 @@ class AuthToolTests(unittest.TestCase):
         rows = {row["label"]: row for row in result.data["matrix"]}
         self.assertEqual(rows["path_trailing_slash"]["status"], 200)
 
+    # -- JWT signing lane -----------------------------------------------
+
+    def _lab_keys(self) -> tuple[str, str]:
+        keys = REPO / "lab" / "fixtures" / "keys"
+        return (keys / "rsa.pem").read_text(), (keys / "rsa.pub").read_text()
+
+    def test_rs256_signed_with_the_private_key_is_accepted(self):
+        private, _public = self._lab_keys()
+        signed = self.run_tool("jwt_sign", alg="RS256", claims={"sub": "alice", "role": "admin"},
+                               key_pem=private, verify=True)
+        self.assertTrue(signed.data["verdict"]["valid"], signed.text)
+        me = self.run_tool("http_request", url=f"{self.base}/api/rs/me",
+                           headers={"Authorization": f"Bearer {signed.data['token']}"})
+        self.assertEqual(me.data["status"], 200)
+        self.assertIn("admin", me.data["body_excerpt"])
+
+    def test_algorithm_confusion_hs256_over_the_public_key(self):
+        _private, public = self._lab_keys()
+        forged = self.run_tool("jwt_sign", alg="HS256", claims={"sub": "alice", "role": "admin"},
+                               key_pem=public, verify=True)
+        self.assertIn("confusion", forged.data["note"])
+        me = self.run_tool("http_request", url=f"{self.base}/api/rs/me",
+                           headers={"Authorization": f"Bearer {forged.data['token']}"})
+        self.assertEqual(me.data["status"], 200, "confused token refused")
+        self.assertIn("admin", me.data["body_excerpt"])
+
+    def test_es256_round_trip_and_tamper_detection(self):
+        from aria_x.tools import jwtkeys
+        ec = (REPO / "lab" / "fixtures" / "keys" / "ec.pem").read_text()
+        signed = jwtkeys.sign("ES256", {"sub": "alice"}, key_pem=ec)
+        self.assertTrue(jwtkeys.verify(signed["token"], key_pem=ec)["valid"])
+        tampered = signed["token"][:-3] + "AAA"
+        self.assertFalse(jwtkeys.verify(tampered, key_pem=ec)["valid"])
+        self.assertEqual(signed["token"].count("."), 2)
+        self.assertEqual(len(jwtkeys._b64d(signed["token"].split(".")[2])), 64)
+
+    def test_none_alg_is_unsigned(self):
+        signed = self.run_tool("jwt_sign", alg="none", claims={"sub": "root"})
+        self.assertTrue(signed.data["token"].endswith("."))
+
+    # -- browser lane ----------------------------------------------------
+
+    def _browser(self):
+        from aria_x.tools import browser
+        if not browser.browser_path():
+            self.skipTest("no chrome/chromium installed")
+        return browser
+
+    def test_urllib_sees_the_wall_but_the_browser_clears_it(self):
+        browser = self._browser()
+        raw = self.run_tool("http_request", url=f"{self.base}/js/42")
+        self.assertIn("Just a moment", raw.data["body_excerpt"])
+        self.assertEqual(raw.data["status"], 200)   # a wall is a 200
+        opened = self.run_tool("browser_session", action="open", url=f"{self.base}/js/42",
+                               wait=20, import_to="jsess", settle_ms=1200)
+        self.assertTrue(opened.ok, opened.error)
+        self.assertTrue(opened.data["cleared"], opened.text)
+        self.assertIn("true", opened.data["excerpt"])
+        self.assertIn("jsok", opened.data["imported_cookies"])
+        self.run_tool("browser_session", action="close")
+
+    def test_browser_cookie_hands_the_work_back_to_plain_http(self):
+        self._browser()
+        opened = self.run_tool("browser_session", action="open", url=f"{self.base}/js/42",
+                               wait=20, import_to="handoff", settle_ms=1200)
+        self.assertTrue(opened.data["cleared"], opened.text)
+        found = self.run_tool("code_probe", url=f"{self.base}/js/{{}}", length=2,
+                              max_attempts=100, match=r'"ok": ?true', session="handoff")
+        self.assertEqual([row["code"] for row in found.data["found"]], ["42"])
+        self.assertFalse(found.data["blocked"])
+        self.run_tool("browser_session", action="close")
+
     # -- vault -----------------------------------------------------------
 
     def test_vault_masks_by_default_and_reveals_on_request(self):

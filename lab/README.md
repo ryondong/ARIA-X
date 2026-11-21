@@ -29,6 +29,8 @@ instead of believed. No dependencies, no Docker, throwaway credentials.
 | L15 | session cookie issued before authentication | `GET /login` sets `sid` | `http_session` |
 | L16 | captcha wall in front of a 2-digit code | `GET /secure/00` returns a reCAPTCHA-shaped 200 | `code_probe` (blocked), token lane (solved) |
 | L17 | local solver stand-in | `POST /solver {sitekey}` → `tok-<sitekey>` | `ARIAX_SOLVER_URL` |
+| L18 | RS256 verifier trusts the token's own alg | HS256 signed with `keys/rsa.pub` is accepted | `jwt_sign` |
+| L19 | JS challenge that mints a clearance cookie | `GET /js/42` walls for urllib, clears for a browser | `browser_session` |
 
 `db.sqlite3` additionally has a deleted row (`invoices.id = 3`, "Secret Co") that
 is still in the file — use `sqlite3 db.sqlite3 ".recover"` after downloading it

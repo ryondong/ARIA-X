@@ -41,7 +41,9 @@ from typing import Any, Iterable
 
 from ..util import json_dumps, json_loads, now_iso, redact, truncate
 from .base import ToolContext, ToolRegistry, ToolResult, ToolSpec
+from . import browser as br
 from . import challenge as chal
+from . import jwtkeys
 from .net import (_ALLOWED_METHODS, DEFAULT_HTTP_TIMEOUT, MAX_HTTP_BYTES, _clean_headers,
                   _decode_body, _response_headers, _save_evidence, _ScopedRedirectHandler)
 from .terminal import audit, clamp_float, clamp_int
@@ -212,10 +214,18 @@ def _mask(value: str) -> str:
 
 
 def _session_headers(ctx: ToolContext, name: str) -> tuple[http.cookiejar.MozillaCookieJar | None, dict[str, str]]:
-    record = _sessions(ctx).get(name) if name else None
-    if not record:
+    """The jar and stored headers for a session; ``None`` when it does not exist.
+
+    Note the membership test, not a truthiness test: a session created by an
+    import is a record with no headers yet, i.e. an empty dict, and ``{}`` is
+    falsy — treating that as "no session" silently dropped every imported cookie.
+    """
+    if not name:
         return None, {}
-    return _load_jar(ctx, name), dict(record.get("headers") or {})
+    sessions = _sessions(ctx)
+    if name not in sessions:
+        return None, {}
+    return _load_jar(ctx, name), dict((sessions.get(name) or {}).get("headers") or {})
 
 
 def _send(ctx: ToolContext, *, url: str, method: str = "GET", headers: dict[str, str] | None = None,
@@ -1470,6 +1480,257 @@ def id_walk(ctx: ToolContext, kwargs: dict[str, Any]) -> ToolResult:
     return ToolResult.success(payload, text=truncate(text, 9000))
 
 
+
+
+# ---------------------------------------------------------------------------
+# tools: headless browser (JS walls, rendered DOM, cookie minting)
+# ---------------------------------------------------------------------------
+
+
+def browser_session(ctx: ToolContext, kwargs: dict[str, Any]) -> ToolResult:
+    """Drive a real headless browser: the only lane that clears a JS challenge."""
+    action = str(kwargs.get("action") or "open").lower()
+    settle = clamp_int(kwargs.get("settle_ms"), 200, 30_000, 3500)
+    state = br.read_state(Path(ctx.workdir))
+
+    if action == "close":
+        killed = br.shutdown(Path(ctx.workdir))
+        return ToolResult.success({"closed": True, "killed": killed}, text="browser closed")
+
+    if action in {"open", "read", "cookies", "eval", "shot"} and not state.get("browser_ws"):
+        try:
+            br.launch(Path(ctx.workdir), user_agent=str(kwargs.get("user_agent") or ""))
+        except OSError as exc:
+            return ToolResult.failure(f"browser launch failed: {exc}")
+
+    try:
+        ws = br.connect(Path(ctx.workdir))
+    except OSError as exc:
+        return ToolResult.failure(f"browser not reachable: {exc}")
+    try:
+        session_id = br._ensure_page(ws, Path(ctx.workdir))
+        url = str(kwargs.get("url") or "").strip()
+
+        if action == "eval":
+            expression = str(kwargs.get("expression") or "1")
+            if url:
+                ctx.scope.require_url(url)
+                br.navigate(ws, session_id, url, settle_ms=settle)
+            value = br.evaluate(ws, session_id, expression)
+            return ToolResult.success({"url": url or None, "value": value},
+                                      text=truncate(json_dumps(value), 4000))
+
+        if action == "cookies":
+            host = str(kwargs.get("host") or "").strip()
+            if not host and url:
+                host = urllib.parse.urlsplit(url).hostname or ""
+            if not host:
+                return ToolResult.failure("host or url is required")
+            harvest = [c for c in br.cookies(ws, session_id)
+                       if br.domain_matches(str(c.get("domain", "")), host)]
+            target = str(kwargs.get("import_to") or "")
+            imported = 0
+            if target and harvest:
+                sessions = _sessions(ctx)
+                jar, _ = _session_headers(ctx, target)
+                if jar is None:
+                    jar = http.cookiejar.MozillaCookieJar(str(_jar_path(ctx, target)))
+                    sessions[target] = sessions.get(target) or {}
+                for cookie in harvest:
+                    _jar_put(jar, cookie)
+                    imported += 1
+                _save_jar(ctx, jar)
+                _write_sessions(ctx, sessions)
+            names = sorted({str(c.get("name")) for c in harvest})
+            evidence = _save_evidence(ctx, {"host": host, "names": names,
+                                            "count": len(harvest), "imported_to": target or None},
+                                      prefix="cookie_harvest")
+            payload = {"host": host, "count": len(harvest), "names": names,
+                       "imported_to": target or None, "imported": imported}
+            if evidence:
+                payload["evidence_path"] = evidence
+            return ToolResult.success(payload,
+                                      text=f"{len(harvest)} cookies for {host}: {names}"
+                                      + (f" (imported into '{target}')" if imported else ""))
+
+        if action == "shot":
+            target_path = Path(ctx.workdir) / "evidence" / f"shot_{int(time.time() * 1000)}.png"
+            size = br.screenshot(ws, session_id, target_path)
+            rel = str(target_path.relative_to(Path(ctx.workdir).resolve()))
+            return ToolResult.success({"path": rel, "bytes": size},
+                                      text=f"screenshot {rel} ({size} bytes)")
+
+        if action not in {"open", "read"}:
+            return ToolResult.failure(f"unknown action '{action}'",
+                                      data={"actions": ["open", "read", "cookies", "eval",
+                                                        "shot", "close"]})
+        if not url:
+            return ToolResult.failure("url is required for open/read")
+
+        decision = ctx.scope.require_url(url)
+        ctx.scope.acquire_slot(decision.host or "")
+
+        # The browser IS the solver: give the challenge script room to finish and
+        # re-read until it clears or the patience budget is gone. A captcha widget
+        # never clears on its own, so stop early for that kind.
+        # One navigation, then poll IN PLACE. Re-navigating restarts the challenge
+        # from zero every time — a real browser load clears itself and moves on, so
+        # the wall disappearing is a change in the DOM, not a new request.
+        patience = clamp_float(kwargs.get("wait"), 0.0, 120.0, 20.0)
+        deadline = time.monotonic() + patience
+        wall: dict[str, Any] | None = None
+        doc: dict[str, Any] = {}
+        rounds = 0
+        br.navigate(ws, session_id, url, settle_ms=settle)
+        while True:
+            doc = br.document(ws, session_id)
+            wall = chal.detect(200, {}, doc.get("html") or "")
+            rounds += 1
+            if not wall or time.monotonic() > deadline:
+                break
+            if wall.get("kind") in {"captcha", "block"} and rounds >= 2:
+                # a widget will not clear itself: keep a short look, then give up
+                if rounds >= 4 or time.monotonic() > deadline - patience / 3:
+                    break
+            time.sleep(2.0 if wall.get("kind") == "js-challenge" else 3.0)
+
+        html = doc.get("html") or ""
+        host = decision.host or ""
+        imported_cookies: list[str] = []
+        target = str(kwargs.get("import_to") or "")
+        if target and host:
+            sessions = _sessions(ctx)
+            jar, _ = _session_headers(ctx, target)
+            if jar is None:
+                jar = http.cookiejar.MozillaCookieJar(str(_jar_path(ctx, target)))
+                sessions[target] = sessions.get(target) or {}
+            _write_sessions(ctx, sessions)
+            for cookie in br.cookies(ws, session_id):
+                if not br.domain_matches(str(cookie.get("domain", "")), host):
+                    continue
+                _jar_put(jar, cookie)
+                imported_cookies.append(str(cookie.get("name")))
+            _save_jar(ctx, jar)
+            if imported_cookies:
+                # A clearance cookie is bound to the client's UA hash: replay it
+                # with a different UA and Cloudflare issues a fresh challenge. Carry
+                # the browser's own UA on the session so plain HTTP inherits it.
+                try:
+                    browser_ua = str(br.evaluate(ws, session_id, "navigator.userAgent") or "")
+                except (OSError, ValueError):
+                    browser_ua = ""
+                if browser_ua:
+                    sessions.setdefault(target, {})["headers"] = {
+                        **(sessions.get(target, {}).get("headers") or {}),
+                        "User-Agent": browser_ua}
+                    sessions[target]["note"] = "seeded by browser_session (UA carried)"
+                    _write_sessions(ctx, sessions)
+
+        shot = ""
+        if kwargs.get("screenshot"):
+            path = Path(ctx.workdir) / "evidence" / f"shot_{int(time.time() * 1000)}.png"
+            try:
+                br.screenshot(ws, session_id, path)
+                shot = str(path.relative_to(Path(ctx.workdir).resolve()))
+            except OSError:
+                shot = ""
+        excerpt = truncate(re.sub(r"\s+", " ", html),
+                           clamp_int(kwargs.get("max_chars"), 200, 20000, 3000))
+        evidence = _save_evidence(ctx, {"url": url, "final_url": doc.get("url"),
+                                        "title": doc.get("title"), "challenge": wall,
+                                        "rounds": rounds, "imported_cookies": imported_cookies,
+                                        "html_excerpt": excerpt, "screenshot": shot or None},
+                                  prefix="browser")
+        payload: dict[str, Any] = {
+            "url": url, "final_url": doc.get("url"), "title": doc.get("title"),
+            "html_bytes": len(html), "rounds": rounds,
+            "challenge": chal.describe(wall) if wall else "",
+            "cleared": bool(wall is None),
+            "imported_cookies": imported_cookies, "screenshot": shot or None, "excerpt": excerpt}
+        if evidence:
+            payload["evidence_path"] = evidence
+        text = (f"{doc.get('title') or '(no title)'} — {doc.get('url') or url}\n"
+                f"{len(html)} bytes rendered, {rounds} round(s)"
+                + (f", WALL {chal.describe(wall)}" if wall else ", no wall")
+                + (f", imported {len(imported_cookies)} cookies into '{target}'"
+                   if imported_cookies else "")
+                + f"\n\n{excerpt}")
+        return ToolResult.success(payload, text=truncate(text, 9000))
+    except (OSError, ValueError) as exc:
+        return ToolResult.failure(f"browser action failed: {exc}", data={"action": action})
+    finally:
+        ws.close()
+
+
+def _jar_put(jar: http.cookiejar.MozillaCookieJar, cookie: dict[str, Any]) -> None:
+    """A CDP cookie dict → an http.cookiejar.Cookie (argument order matters)."""
+    domain = str(cookie.get("domain") or "")
+    jar.set_cookie(http.cookiejar.Cookie(
+        version=0, name=str(cookie.get("name")), value=str(cookie.get("value")),
+        port=None, port_specified=False,
+        # host-only cookie unless the server scoped it to a parent domain
+        domain=domain.lstrip("."), domain_specified=domain.startswith("."),
+        domain_initial_dot=domain.startswith("."),
+        path=str(cookie.get("path") or "/"), path_specified=True,
+        secure=bool(cookie.get("secure")),
+        # CDP reports -1 for a session cookie; a literal -1 in cookiejar is never sent
+        expires=None if (cookie.get("expires") or 0) <= 0 else cookie.get("expires"),
+        discard=(cookie.get("expires") or 0) <= 0,
+        comment=None, comment_url=None, rest={"HttpOnly": True} if cookie.get("httpOnly") else {},
+        rfc2109=False))
+
+
+
+
+# ---------------------------------------------------------------------------
+# tools: JWT signing (RS*/ES*, alg=none, HS-confusion)
+# ---------------------------------------------------------------------------
+
+
+def jwt_sign(ctx: ToolContext, kwargs: dict[str, Any]) -> ToolResult:
+    alg = str(kwargs.get("alg") or "").strip()
+    claims = kwargs.get("claims")
+    if not alg:
+        return ToolResult.failure("alg is required",
+                                  data={"alg": ["none", "HS256", "RS256", "RS384", "RS512", "ES256"]})
+    if not isinstance(claims, dict) or not claims:
+        return ToolResult.failure("claims must be a non-empty object")
+    key_pem = str(kwargs.get("key_pem") or "")
+    key_file = str(kwargs.get("key_file") or "")
+    if key_file and not key_pem:
+        path = Path(key_file) if Path(key_file).is_absolute() else Path(ctx.workdir) / key_file
+        try:
+            key_pem = path.read_text(encoding="utf-8")
+        except OSError as exc:
+            return ToolResult.failure(f"key_file unreadable: {exc}")
+    try:
+        signed = jwtkeys.sign(alg, claims, key_pem=key_pem,
+                              header=kwargs.get("header"),
+                              hmac_secret=str(kwargs.get("hmac_secret") or ""))
+    except (ValueError, IndexError, KeyError) as exc:
+        return ToolResult.failure(f"signing failed: {exc}")
+
+    verdict = None
+    if kwargs.get("verify"):
+        try:
+            verdict = jwtkeys.verify(signed["token"], key_pem=key_pem,
+                                     hmac_secret=str(kwargs.get("hmac_secret") or ""))
+        except ValueError as exc:
+            verdict = {"valid": False, "detail": str(exc)}
+    evidence = _save_evidence(ctx, {"alg": signed["alg"], "note": signed["note"],
+                                    "claims": claims, "header": kwargs.get("header"),
+                                    "token_masked": _mask(signed["token"]),
+                                    "verdict": verdict}, prefix="jwt_sign")
+    payload: dict[str, Any] = {"token": signed["token"], "alg": signed["alg"],
+                               "note": signed["note"], "verdict": verdict}
+    if evidence:
+        payload["evidence_path"] = evidence
+    text = f"{signed['alg']} token ({signed['note']}) — {len(signed['token'])} chars"
+    if verdict is not None:
+        text += f"\nself-verify: {'VALID' if verdict.get('valid') else 'INVALID'} ({verdict.get('detail')})"
+    return ToolResult.success(payload, text=text)
+
+
 # ---------------------------------------------------------------------------
 # registration
 # ---------------------------------------------------------------------------
@@ -1650,3 +1911,42 @@ def register(registry: ToolRegistry) -> None:
             "required": ["action"]},
         risk="low", tags=("auth", "secret"), read_only=False,
     ), vault)
+
+    registry.add(ToolSpec(
+        name="browser_session",
+        description=(
+            "Headless Chrome/Edge over CDP. The ONLY lane that clears a js-challenge wall: it runs "
+            "the page's own challenge script, waits (wait seconds, default 12) and re-reads until the "
+            "wall clears or patience runs out. Returns the RENDERED DOM, title and final URL — content "
+            "that never exists in the raw HTTP body. import_to=<session> harvests the minted cookies "
+            "into a jar so the plain HTTP tools can take over afterwards. Also eval/shot/close. Target "
+            "navigations are scope-checked; sub-resources are not."
+        ),
+        parameters={"type": "object", "properties": {
+            "action": {"type": "string", "enum": ["open", "read", "cookies", "eval", "shot", "close"]},
+            "url": {"type": "string"}, "wait": {"type": "number"},
+            "settle_ms": {"type": "integer"}, "import_to": {"type": "string"},
+            "host": {"type": "string"}, "expression": {"type": "string"},
+            "max_chars": {"type": "integer"}, "screenshot": {"type": "boolean"},
+            "user_agent": {"type": "string"}},
+            "required": ["action"]},
+        risk="high", tags=("network", "http", "browser", "challenge"), requires_scope=True,
+    ), browser_session)
+
+    registry.add(ToolSpec(
+        name="jwt_sign",
+        description=(
+            "Sign a JWT the decoder cannot: alg none, HS256/384/512, RS256/384/512, ES256 "
+            "(ECDSA P-256, raw r||s). key_pem/key_file takes a private key; pass the server's PUBLIC "
+            "key as key_pem with alg=HS256 for algorithm confusion. verify=true self-checks the result."
+        ),
+        parameters={"type": "object", "properties": {
+            "alg": {"type": "string", "enum": ["none", "HS256", "HS384", "HS512", "RS256",
+                                               "RS384", "RS512", "ES256"]},
+            "claims": {"type": "object"},
+            "key_pem": {"type": "string"}, "key_file": {"type": "string"},
+            "hmac_secret": {"type": "string"}, "header": {"type": "object"},
+            "verify": {"type": "boolean"}},
+            "required": ["alg", "claims"]},
+        risk="low", tags=("auth", "jwt"), read_only=False,
+    ), jwt_sign)
